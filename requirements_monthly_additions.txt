@@ -1,0 +1,5 @@
+# Add these if missing
+openpyxl
+msoffcrypto-tool
+pandas
+xlrd
