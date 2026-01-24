@@ -1,15 +1,18 @@
-name: inbox-bot (main)
+name: inbox-bot (monthly)
 
 on:
   workflow_dispatch:
+  # 例：毎月1日 09:15 JST 相当（UTCで 00:15）
+  # schedule:
+  #   - cron: "15 0 1 * *"
 
 concurrency:
-  group: inbox-bot-main
+  group: inbox-bot-monthly
   cancel-in-progress: false
 
 jobs:
-  run_main:
-    name: Run main pipeline (papers/patents/memos etc)
+  run_monthly:
+    name: Run monthly-report pipeline (Excel)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -25,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot (main)
+      - name: Run monthly-report pipeline
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
@@ -38,7 +41,10 @@ jobs:
           OUTBOX_PATH: ${{ secrets.OUTBOX_PATH }}
           STATE_PATH: ${{ secrets.STATE_PATH }}
 
-          OPENAI_MODEL: gpt-5.2
+          MONTHLY_MODE: multistage
+          RPA_XLSX_PASSWORD: ${{ secrets.RPA_XLSX_PASSWORD }}
+
+          OPENAI_MODEL: gpt-5-mini
           DEPTH: medium
           OPENAI_TIMEOUT: "120"
           OPENAI_MAX_RETRIES: "2"
@@ -47,7 +53,7 @@ jobs:
           MAX_INPUT_CHARS: "80000"
 
           MAIL_ENABLE: "1"
-          MAIL_SUBJECT_PREFIX: "[inbox-bot]"
+          MAIL_SUBJECT_PREFIX: "[inbox-bot][monthly]"
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
@@ -60,4 +66,5 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
 
         run: |
-          python -m src.main
+          python -m src.monthly_main
+ 
