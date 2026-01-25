@@ -69,6 +69,34 @@ jobs:
           echo "Listing repo root:"
           ls -la
 
+          echo ""
+          echo "===== DEBUG: show monthly_main.py (head) ====="
+          if [ -f src/monthly_main.py ]; then
+            echo "--- grep sys.exit / SystemExit in src/monthly_main.py"
+            grep -nE "sys\.exit|SystemExit|raise SystemExit|exit\(" -n src/monthly_main.py || true
+            echo "--- head(220) with line numbers"
+            nl -ba src/monthly_main.py | head -n 220
+          else
+            echo "src/monthly_main.py not found"
+          fi
+
+          echo ""
+          echo "===== DEBUG: show config env keys (presence only) ====="
+          python - <<'PY'
+          import os
+          keys = [
+              "OPENAI_API_KEY",
+              "DROPBOX_REFRESH_TOKEN","DROPBOX_APP_KEY","DROPBOX_APP_SECRET",
+              "MONTHLY_INBOX_PATH","MONTHLY_OUTBOX_DIR","MONTHLY_OVERVIEW_DIR","MONTHLY_PREP_DIR",
+              "STATE_PATH",
+              "MONTHLY_MODE","OPENAI_MODEL","DEPTH","OPENAI_TIMEOUT","OPENAI_MAX_RETRIES","OPENAI_MAX_OUTPUT_TOKENS",
+              "MAX_FILES_PER_RUN","MAX_INPUT_CHARS",
+          ]
+          for k in keys:
+              v = os.environ.get(k)
+              print(f"{k}={'SET' if (v is not None and v!='') else 'MISSING'}")
+          PY
+
           # ---- run and keep exit code ----
           exit_code=0
           python - <<'PY' || exit_code=$?
