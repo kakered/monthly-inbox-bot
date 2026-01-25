@@ -65,4 +65,17 @@ jobs:
         run: |
           set -euxo pipefail
           python -V
-          python -m src.monthly_main
+
+          # ---- debug wrapper: force error visibility ----
+          python - <<'PY'
+          import runpy, sys, traceback
+          try:
+              runpy.run_module("src.monthly_main", run_name="__main__")
+          except SystemExit as e:
+              print(f"[wrapper] SystemExit: code={e.code!r}", file=sys.stderr)
+              raise
+          except Exception:
+              print("[wrapper] Unhandled exception:", file=sys.stderr)
+              traceback.print_exc()
+              sys.exit(1)
+          PY
