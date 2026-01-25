@@ -10,10 +10,14 @@ concurrency:
   group: inbox-bot-monthly
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   run_monthly:
     name: Run monthly-report pipeline (Excel)
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,22 +32,42 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ---- secrets sanity check (NO SECRET LEAK) ----
+      - name: Sanity check Dropbox paths (no secret leak)
+        env:
+          MONTHLY_INBOX_PATH: ${{ secrets.MONTHLY_INBOX_PATH }}
+          MONTHLY_PREP_DIR: ${{ secrets.MONTHLY_PREP_DIR }}
+          MONTHLY_OVERVIEW_DIR: ${{ secrets.MONTHLY_OVERVIEW_DIR }}
+        run: |
+          python - <<'PY'
+          import os, hashlib
+          keys = ["MONTHLY_INBOX_PATH","MONTHLY_PREP_DIR","MONTHLY_OVERVIEW_DIR"]
+          for k in keys:
+              v = os.environ.get(k, "")
+              h = hashlib.sha256(v.encode("utf-8")).hexdigest()[:12] if v else "EMPTY"
+              ok = v.startswith("/Apps/monthly-inbox-bot/")
+              print(f"{k}: len={len(v)} sha256_12={h} startswith_/Apps/monthly-inbox-bot={ok}")
+          PY
+
       - name: Run monthly-report pipeline
         env:
+          # Required
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          DROPBOX_ACCESS_TOKEN: ${{ secrets.DROPBOX_ACCESS_TOKEN }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
 
-          INBOX_PATH: ${{ secrets.INBOX_PATH }}
-          OUTBOX_PATH: ${{ secrets.OUTBOX_PATH }}
+          MONTHLY_INBOX_PATH: ${{ secrets.MONTHLY_INBOX_PATH }}
+          MONTHLY_OUTBOX_DIR: ${{ secrets.MONTHLY_OUTBOX_DIR }}
+          MONTHLY_OVERVIEW_DIR: ${{ secrets.MONTHLY_OVERVIEW_DIR }}
+          MONTHLY_PREP_DIR: ${{ secrets.MONTHLY_PREP_DIR }}
+
+          # Optional (future use; safe to keep set)
           STATE_PATH: ${{ secrets.STATE_PATH }}
 
+          # Pipeline behavior
           MONTHLY_MODE: multistage
-          RPA_XLSX_PASSWORD: ${{ secrets.RPA_XLSX_PASSWORD }}
-
           OPENAI_MODEL: gpt-5-mini
           DEPTH: medium
           OPENAI_TIMEOUT: "120"
@@ -52,19 +76,23 @@ jobs:
           MAX_FILES_PER_RUN: "200"
           MAX_INPUT_CHARS: "80000"
 
-          MAIL_ENABLE: "1"
-          MAIL_SUBJECT_PREFIX: "[inbox-bot][monthly]"
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-          MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
-          MAIL_SMTP_HOST: ${{ secrets.MAIL_SMTP_HOST }}
-          MAIL_SMTP_PORT: ${{ secrets.MAIL_SMTP_PORT }}
-
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          # Logging
+          PYTHONUNBUFFERED: "1"
 
         run: |
-          python -m src.monthly_main
- 
+          set -euxo pipefail
+          python -V
+
+          # ---- debug wrapper: force error visibility ----
+          python - <<'PY'
+          import runpy, sys, traceback
+          try:
+              runpy.run_module("src.monthly_main", run_name="__main__")
+          except SystemExit as e:
+              print(f"[wrapper] SystemExit: code={e.code!r}", file=sys.stderr)
+              raise
+          except Exception:
+              print("[wrapper] Unhandled exception:", file=sys.stderr)
+              traceback.print_exc()
+              sys.exit(1)
+          PY

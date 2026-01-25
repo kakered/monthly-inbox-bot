@@ -1,292 +1,314 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""src.monthly_main
-
-- MONTHLY_MODE=multistage: multistage pipeline を実行
-- それ以外: 単発（月報→overview/per_person）を実行
-
-NEW (logging):
-- 1 run = 1 log file on Dropbox:
-  /_system/logs/YYYY-MM-DD/monthly_YYYYMMDD-HHMMSS_<runid>.log
-- Always logs START/END + config snapshot
-- On error: logs full traceback then re-raises (GitHub Actions fails =気づける)
-"""
-
+import json
 import os
+import re
 import sys
-import uuid
-import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Any, Dict, List, Optional, Tuple
+
+from src.dropbox_io import DropboxIO
+
+JST = timezone(timedelta(hours=9))
 
 
-# -------------------------
-# Time helpers (JST)
-# -------------------------
-_JST = timezone(timedelta(hours=9))
+@dataclass(frozen=True)
+class Paths:
+    stage00: str
+    stage10: str
+    logs: str
+    outbox: str
 
 
-def _now_jst() -> datetime:
-    return datetime.now(tz=_JST)
+def now_jst_str() -> str:
+    return datetime.now(JST).strftime("%Y%m%d_%H%M%S")
 
 
-def _ts_jst() -> str:
-    return _now_jst().strftime("%Y-%m-%d %H:%M:%S JST")
+def safe_name(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[\\/:*?\"<>|]", "_", name)
+    name = re.sub(r"\s+", " ", name)
+    return name
 
 
-def _date_jst() -> str:
-    return _now_jst().strftime("%Y-%m-%d")
+def log_event(log_path_local: str, event: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(log_path_local), exist_ok=True)
+    with open(log_path_local, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def _stamp_jst_compact() -> str:
-    return _now_jst().strftime("%Y%m%d-%H%M%S")
+def _need_env(key: str) -> str:
+    v = os.environ.get(key)
+    if not v:
+        raise ValueError(f"Missing required env: {key}")
+    return v
 
 
-# -------------------------
-# Dropbox logging
-# -------------------------
-def _norm_dbx_path(p: str) -> str:
+def _norm_path(p: str) -> str:
     p = (p or "").strip()
+    if not p:
+        return p
     if not p.startswith("/"):
         p = "/" + p
+    if len(p) > 1:
+        p = p.rstrip("/")
     return p
 
 
-def _ensure_folder_best_effort(dbx_io, folder: str) -> None:
+def _app_prefixes(app_folder_name: str) -> List[str]:
     """
-    Best-effort folder creation.
-    - Works even if DropboxIO has no ensure_folder().
-    - Never raises (logging should not break pipeline).
+    Try both English and Japanese 'Apps' folder roots just in case.
+    (Dropbox UI may show アプリ; API is usually /Apps, but we try both.)
     """
-    try:
-        folder = _norm_dbx_path(folder)
-        # If DropboxIO has ensure_folder, use it.
-        if hasattr(dbx_io, "ensure_folder") and callable(getattr(dbx_io, "ensure_folder")):
-            dbx_io.ensure_folder(folder)  # type: ignore
-            return
-
-        # Fallback: call Dropbox SDK directly
-        dbx = getattr(dbx_io, "dbx", None)
-        if dbx is None:
-            return
-
-        try:
-            dbx.files_get_metadata(folder)
-            return
-        except Exception:
-            pass
-
-        try:
-            dbx.files_create_folder_v2(folder)
-        except Exception:
-            return
-    except Exception:
-        return
-
-
-class RunLogger:
-    """
-    Minimal run logger that writes to Dropbox (overwrite on flush).
-    Designed to never crash the main pipeline.
-    """
-
-    def __init__(self, dbx_io, log_path: str):
-        self.dbx_io = dbx_io
-        self.log_path = _norm_dbx_path(log_path)
-        self.lines: List[str] = []
-
-    def log(self, msg: str) -> None:
-        try:
-            line = f"[{_ts_jst()}] {msg}\n"
-            self.lines.append(line)
-        except Exception:
-            # never crash
-            pass
-
-    def flush(self) -> None:
-        try:
-            text = "".join(self.lines)
-            # DropboxIO has upload_text in your repo snapshot
-            if hasattr(self.dbx_io, "upload_text") and callable(getattr(self.dbx_io, "upload_text")):
-                self.dbx_io.upload_text(self.log_path, text, mode="overwrite")  # type: ignore
-                return
-
-            # fallback: upload_bytes if only binary uploader exists
-            if hasattr(self.dbx_io, "upload_bytes") and callable(getattr(self.dbx_io, "upload_bytes")):
-                self.dbx_io.upload_bytes(self.log_path, text.encode("utf-8"), mode="overwrite")  # type: ignore
-                return
-
-            # last resort: direct SDK
-            dbx = getattr(self.dbx_io, "dbx", None)
-            if dbx is None:
-                return
-            from dropbox.files import WriteMode  # local import
-            dbx.files_upload(text.encode("utf-8"), self.log_path, mode=WriteMode.overwrite, mute=True)
-        except Exception:
-            # logging must never crash pipeline
-            return
-
-
-def _build_log_path(run_id: str) -> str:
-    root = os.getenv("MONTHLY_LOG_ROOT", "/_system/logs").strip() or "/_system/logs"
-    root = _norm_dbx_path(root).rstrip("/")
-    day_dir = f"{root}/{_date_jst()}"
-    filename = f"monthly_{_stamp_jst_compact()}_{run_id}.log"
-    return day_dir, f"{day_dir}/{filename}"
-
-
-def _snapshot_cfg() -> str:
-    """
-    Log-friendly config snapshot (NO secrets).
-    """
-    keys = [
-        "MONTHLY_MODE",
-        "MONTHLY_STAGE",
-        "MONTHLY_INBOX_PATH",
-        "MONTHLY_PREP_DIR",
-        "MONTHLY_OUTBOX_DIR",
-        "MONTHLY_OVERVIEW_DIR",
-        "STATE_PATH",
-        "OPENAI_MODEL",
-        "DEPTH",
-        "MAX_FILES_PER_RUN",
-        "MONTHLY_MAX_FILES",
+    app_folder_name = (app_folder_name or "").strip() or "monthly-inbox-bot"
+    return [
+        f"/Apps/{app_folder_name}",
+        f"/アプリ/{app_folder_name}",
     ]
-    parts = []
-    for k in keys:
-        v = os.getenv(k, "")
-        if v is None:
-            v = ""
-        v = str(v).strip()
-        if v:
-            parts.append(f"{k}={v}")
-    # GitHub Actions context (safe)
-    sha = (os.getenv("GITHUB_SHA") or "").strip()
-    if sha:
-        parts.append(f"GITHUB_SHA={sha[:12]}")
-    return " ".join(parts) if parts else "(no env snapshot)"
 
 
-# -------------------------
-# main
-# -------------------------
-def main() -> None:
-    # Always create Dropbox logger first (best effort).
-    run_id = uuid.uuid4().hex[:8]
+def _candidate_paths(raw: str, app_folder_name: str) -> List[str]:
+    raw = _norm_path(raw)
+    if not raw:
+        return []
 
-    # Build Dropbox logger using existing DropboxIO
-    logger: Optional[RunLogger] = None
-    dbx_io = None
+    candidates: List[str] = []
+
+    def add(x: str) -> None:
+        x = _norm_path(x)
+        if x and x not in candidates:
+            candidates.append(x)
+
+    # as-is
+    add(raw)
+
+    # add prefixes (full-dropbox style)
+    for pref in _app_prefixes(app_folder_name):
+        if not raw.startswith(pref + "/") and raw != pref:
+            add(pref + raw)
+
+    # strip prefixes (app-folder style)
+    for pref in _app_prefixes(app_folder_name):
+        if raw.startswith(pref + "/"):
+            add(raw[len(pref):])
+        elif raw == pref:
+            add("/")
+
+    return candidates
+
+
+def _exists_folder_by_list(dbx: DropboxIO, path: str) -> Tuple[bool, Optional[str]]:
     try:
-        from .dropbox_io import DropboxIO  # lazy import
-        dbx_io = DropboxIO.from_env()
-        day_dir, log_path = _build_log_path(run_id)
-        _ensure_folder_best_effort(dbx_io, day_dir)
-        logger = RunLogger(dbx_io, log_path)
-        logger.log(f"START run_id={run_id}")
-        logger.log(f"cfg { _snapshot_cfg() }")
-    except Exception:
-        # If Dropbox logger cannot be initialized, continue without it.
-        logger = None
-
-    def _log(msg: str) -> None:
-        if logger:
-            logger.log(msg)
-
-    def _flush() -> None:
-        if logger:
-            logger.flush()
-
-    try:
-        mode = (os.getenv("MONTHLY_MODE") or "single").strip().lower()
-        _log(f"mode={mode}")
-
-        if mode == "multistage":
-            _log("stage=multistage ENTER")
-            _flush()
-            from .monthly_pipeline_MULTISTAGE import run_multistage
-
-            run_multistage()
-            _log("stage=multistage EXIT ok=True")
-            _flush()
-            return
-
-        # -------------------------
-        # single-stage (legacy)
-        # -------------------------
-        _log("stage=single ENTER")
-        _flush()
-
-        from .excel_exporter import process_monthly_workbook
-
-        inbox_path = os.getenv("MONTHLY_INBOX_PATH", "/0-Inbox/monthlyreports")
-        outbox_dir = os.getenv("MONTHLY_OUTBOX_DIR", "/0-Outbox/monthly")
-        password = os.getenv("RPA_XLSX_PASSWORD") or None
-
-        items = dbx_io.list_folder(inbox_path) if dbx_io else []
-        target = None
-        for it in items:
-            name = getattr(it, "name", "")
-            if str(name).lower().endswith((".xlsx", ".xls")):
-                target = it
-                break
-
-        if not target:
-            _log(f"No Excel found under: {inbox_path}")
-            _flush()
-            print(f"[MONTHLY] No Excel found under: {inbox_path}")
-            return
-
-        path = getattr(target, "path", None) or getattr(target, "path_lower", None)
-        _log(f"Processing: {path}")
-        _flush()
-
-        xlsx_bytes = dbx_io.download_to_bytes(path)
-
-        overview_bytes, per_person_bytes = process_monthly_workbook(
-            xlsx_bytes=xlsx_bytes,
-            password=password,
-        )
-
-        base = os.path.basename(path)
-        ts = os.getenv("MONTHLY_TS") or _stamp_jst_compact()
-
-        overview_name = f"{base}__overview__{ts}.xlsx"
-        per_name = f"{base}__per_person__{ts}.xlsx"
-
-        # ensure outbox folder exists (best effort)
-        _ensure_folder_best_effort(dbx_io, outbox_dir)
-
-        dbx_io.upload_bytes(f"{outbox_dir}/{overview_name}", overview_bytes)
-        dbx_io.upload_bytes(f"{outbox_dir}/{per_name}", per_person_bytes)
-
-        _log(f"Wrote: {outbox_dir}/{overview_name}")
-        _log(f"Wrote: {outbox_dir}/{per_name}")
-        _log("stage=single EXIT ok=True")
-        _flush()
-
-        print(f"[MONTHLY] Wrote: {outbox_dir}/{overview_name}")
-        print(f"[MONTHLY] Wrote: {outbox_dir}/{per_name}")
-
+        dbx.list_folder(path)
+        return True, None
     except Exception as e:
-        tb = traceback.format_exc()
-        _log(f"ERROR type={type(e).__name__} msg={e}")
-        _log("TRACEBACK_BEGIN")
-        if logger:
-            # traceback lines can be large; write as-is
-            for line in tb.splitlines():
-                logger.lines.append(line + "\n")
-        _log("TRACEBACK_END")
-        _log("END ok=False")
-        _flush()
-        # Re-raise so GitHub Actions shows failure
+        return False, repr(e)
+
+
+def _try_list_root(dbx: DropboxIO) -> Dict[str, Any]:
+    """
+    Print what the token can see at root.
+    This is the single most important diagnostic for 'folder not found'.
+    """
+    out: Dict[str, Any] = {"attempts": []}
+
+    for p in ("", "/", "/Apps", "/アプリ"):
+        try:
+            items = dbx.list_folder(p)
+            # keep it small and safe
+            names = []
+            for it in (items or [])[:50]:
+                nm = it.get("name") or it.get("path_display") or it.get("path") or ""
+                if nm:
+                    names.append(nm)
+            out["attempts"].append({"path": p, "ok": True, "count": len(items or []), "sample": names})
+        except Exception as e:
+            out["attempts"].append({"path": p, "ok": False, "err": repr(e)})
+
+    return out
+
+
+def resolve_paths_or_die(dbx: DropboxIO) -> Paths:
+    stage00_raw = _need_env("MONTHLY_INBOX_PATH")
+    stage10_raw = _need_env("MONTHLY_PREP_DIR")
+    logs_raw = _need_env("MONTHLY_OVERVIEW_DIR")
+    outbox_raw = _need_env("MONTHLY_OUTBOX_DIR")
+
+    app_folder_name = os.environ.get("DROPBOX_APP_FOLDER_NAME", "monthly-inbox-bot").strip() or "monthly-inbox-bot"
+
+    c_stage00 = _candidate_paths(stage00_raw, app_folder_name)
+    c_stage10 = _candidate_paths(stage10_raw, app_folder_name)
+    c_logs = _candidate_paths(logs_raw, app_folder_name)
+    c_outbox = _candidate_paths(outbox_raw, app_folder_name)
+
+    debug: Dict[str, Any] = {
+        "app_folder_name": app_folder_name,
+        "candidates": {
+            "stage00": c_stage00,
+            "stage10": c_stage10,
+            "logs": c_logs,
+            "outbox": c_outbox,
+        },
+        "checks": {
+            "stage00": [],
+            "stage10": [],
+            "logs": [],
+            "outbox": [],
+        },
+        "root_listing": _try_list_root(dbx),
+    }
+
+    def pick(key: str, cands: List[str]) -> str:
+        for p in cands:
+            ok, err = _exists_folder_by_list(dbx, p)
+            debug["checks"][key].append({"path": p, "ok": ok, "err": err})
+            if ok:
+                return p
+        raise RuntimeError(f"Dropbox folder not found ({key}): {cands[0] if cands else '(empty)'}")
+
+    try:
+        stage00 = pick("stage00", c_stage00)
+        stage10 = pick("stage10", c_stage10)
+        logs = pick("logs", c_logs)
+        outbox = pick("outbox", c_outbox)
+    except Exception as e:
+        print(f"[monthly_main] FATAL: resolve paths failed: {e!r}", file=sys.stderr)
+        print("[monthly_main] resolve debug (includes root listing):", file=sys.stderr)
+        print(json.dumps(debug, ensure_ascii=False, indent=2), file=sys.stderr)
         raise
 
-    finally:
-        _log("END ok=True (finally)")
-        _flush()
+    return Paths(stage00=stage00, stage10=stage10, logs=logs, outbox=outbox)
+
+
+def list_stage00_xlsx(dbx: DropboxIO, stage00: str) -> List[Dict[str, Any]]:
+    files = dbx.list_folder(stage00)
+    out: List[Dict[str, Any]] = []
+    for it in files or []:
+        name = (it.get("name") or "")
+        if name.lower().endswith(".xlsx") and not name.startswith("~$"):
+            out.append(it)
+    return out
+
+
+def _best_path(it: Dict[str, Any], fallback_dir: str) -> str:
+    for k in ("path", "path_display", "path_lower"):
+        p = it.get(k)
+        if p:
+            return p
+    nm = it.get("name") or "input.xlsx"
+    return f"{fallback_dir.rstrip('/')}/{nm}"
+
+
+def main() -> int:
+    run_id = now_jst_str()
+    log_path_local = f"/tmp/monthly_{run_id}.jsonl"
+
+    try:
+        dbx = DropboxIO.from_env()
+    except Exception as e:
+        print(f"[monthly_main] FATAL: DropboxIO.from_env() failed: {e!r}", file=sys.stderr)
+        log_event(log_path_local, {
+            "ts": datetime.now(JST).isoformat(),
+            "run_id": run_id,
+            "stage": "bootstrap",
+            "level": "fatal",
+            "error": repr(e),
+        })
+        return 1
+
+    try:
+        paths = resolve_paths_or_die(dbx)
+    except Exception as e:
+        log_event(log_path_local, {
+            "ts": datetime.now(JST).isoformat(),
+            "run_id": run_id,
+            "stage": "bootstrap",
+            "level": "fatal",
+            "error": repr(e),
+        })
+        return 1
+
+    log_event(log_path_local, {
+        "ts": datetime.now(JST).isoformat(),
+        "run_id": run_id,
+        "stage": "bootstrap",
+        "msg": "start",
+        "paths": paths.__dict__,
+    })
+
+    try:
+        inputs = list_stage00_xlsx(dbx, paths.stage00)
+        log_event(log_path_local, {
+            "ts": datetime.now(JST).isoformat(),
+            "run_id": run_id,
+            "stage": "00_list",
+            "count": len(inputs),
+            "files": [x.get("name") for x in inputs],
+        })
+    except Exception as e:
+        print(f"[monthly_main] ERROR: listing stage00 failed. stage00={paths.stage00!r} err={e!r}", file=sys.stderr)
+        log_event(log_path_local, {
+            "ts": datetime.now(JST).isoformat(),
+            "run_id": run_id,
+            "stage": "00_list",
+            "level": "error",
+            "stage00": paths.stage00,
+            "error": repr(e),
+        })
+        return 1
+
+    if not inputs:
+        try:
+            dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
+        except Exception as e:
+            print(f"[monthly_main] WARN: upload log failed (no inputs): {e!r}", file=sys.stderr)
+        return 0
+
+    processed = 0
+    for it in inputs:
+        src_path = _best_path(it, paths.stage00)
+        src_name = it.get("name") or "input.xlsx"
+        base = safe_name(os.path.splitext(src_name)[0])
+        dst_name = f"{base}__preformat.xlsx"
+        dst_path = f"{paths.stage10}/{dst_name}"
+
+        try:
+            if hasattr(dbx, "copy"):
+                dbx.copy(src_path, dst_path)
+            else:
+                data = dbx.download_bytes(src_path)
+                dbx.upload_bytes(data, dst_path)
+
+            processed += 1
+            log_event(log_path_local, {
+                "ts": datetime.now(JST).isoformat(),
+                "run_id": run_id,
+                "stage": "10_write",
+                "src": src_path,
+                "dst": dst_path,
+                "status": "ok",
+            })
+        except Exception as e:
+            print(f"[monthly_main] ERROR: copy failed src={src_path!r} dst={dst_path!r} err={e!r}", file=sys.stderr)
+            log_event(log_path_local, {
+                "ts": datetime.now(JST).isoformat(),
+                "run_id": run_id,
+                "stage": "10_write",
+                "src": src_path,
+                "dst": dst_path,
+                "status": "error",
+                "error": repr(e),
+            })
+
+    try:
+        dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
+    except Exception as e:
+        print(f"[monthly_main] WARN: failed to upload run log: {e!r}", file=sys.stderr)
+
+    return 0 if processed > 0 else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
