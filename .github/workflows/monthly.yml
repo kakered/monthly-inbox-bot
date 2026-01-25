@@ -1,3 +1,33 @@
+name: inbox-bot (monthly)
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "15 0 1 * *"  # 毎月1日 09:15 JST
+
+concurrency:
+  group: inbox-bot-monthly
+  cancel-in-progress: false
+
+jobs:
+  run_monthly:
+    name: Run monthly-report pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Run monthly-report pipeline
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -11,7 +41,6 @@
           MONTHLY_OVERVIEW_DIR: ${{ secrets.MONTHLY_OVERVIEW_DIR }}
           MONTHLY_PREP_DIR: ${{ secrets.MONTHLY_PREP_DIR }}
 
-          # もし state を使うなら（今後）
           STATE_PATH: ${{ secrets.STATE_PATH }}
 
           MONTHLY_MODE: multistage
@@ -22,5 +51,6 @@
           OPENAI_MAX_OUTPUT_TOKENS: "5000"
           MAX_FILES_PER_RUN: "200"
           MAX_INPUT_CHARS: "80000"
+
         run: |
           python -m src.monthly_main
