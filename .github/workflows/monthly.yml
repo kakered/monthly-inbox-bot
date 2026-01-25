@@ -65,9 +65,13 @@ jobs:
         run: |
           set -euxo pipefail
           python -V
+          echo "PWD=$(pwd)"
+          echo "Listing repo root:"
+          ls -la
 
-          # ---- debug wrapper: force error visibility ----
-          python - <<'PY'
+          # ---- run and keep exit code ----
+          exit_code=0
+          python - <<'PY' || exit_code=$?
           import runpy, sys, traceback
           try:
               runpy.run_module("src.monthly_main", run_name="__main__")
@@ -79,3 +83,31 @@ jobs:
               traceback.print_exc()
               sys.exit(1)
           PY
+
+          echo ""
+          echo "===== DEBUG: show candidate logs/files (best-effort) ====="
+          echo "Top-level tree:"
+          find . -maxdepth 3 -type f | sed 's|^\./||' | head -n 200 || true
+
+          echo ""
+          echo "Recent .log/.txt/.json/.jsonl under repo (tail):"
+          find . -type f \( -name "*.log" -o -name "*.txt" -o -name "*.json" -o -name "*.jsonl" \) -print | head -n 200 || true
+
+          echo ""
+          echo "Tail of likely log dirs (if exist):"
+          for d in logs log _system system; do
+            if [ -d "$d" ]; then
+              echo "--- ls -la $d"
+              ls -la "$d" || true
+              echo "--- recent files in $d"
+              find "$d" -type f -maxdepth 3 -print | head -n 50 || true
+              echo "--- tail (first 3 files) in $d"
+              for f in $(find "$d" -type f -maxdepth 3 | head -n 3); do
+                echo "----- $f (tail 200)"
+                tail -n 200 "$f" || true
+              done
+            fi
+          done
+
+          echo "===== DEBUG END ====="
+          exit $exit_code
