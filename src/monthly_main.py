@@ -4,22 +4,21 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from src.dropbox_io import DropboxIO  # 既存を利用（なければ後で合わせます）
+from src.dropbox_io import DropboxIO
 
 JST = timezone(timedelta(hours=9))
 
 
 @dataclass(frozen=True)
 class Paths:
-    root: str
-    stage00: str
-    stage10: str
-    logs: str
+    stage00: str  # input xlsx folder on Dropbox
+    stage10: str  # preformat output folder on Dropbox
+    logs: str     # logs folder on Dropbox
 
 
 def now_jst_str() -> str:
@@ -27,8 +26,7 @@ def now_jst_str() -> str:
 
 
 def safe_name(name: str) -> str:
-    # Dropbox/Windows でも事故りにくい命名に寄せる
-    name = name.strip()
+    name = (name or "").strip()
     name = re.sub(r"[\\/:*?\"<>|]", "_", name)
     name = re.sub(r"\s+", " ", name)
     return name
@@ -40,53 +38,100 @@ def log_event(log_path_local: str, event: Dict[str, Any]) -> None:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def env_or_default(key: str, default: str) -> str:
+def _need_env(key: str) -> str:
     v = os.environ.get(key)
-    return v if v else default
+    if not v:
+        raise ValueError(f"Missing required env: {key}")
+    return v
 
 
-def build_paths() -> Paths:
-    # INBOX_PATH / OUTBOX_PATH はPDF側の名残があり得るので使いません（混乱防止）
-    root = env_or_default("MONTHLY_ROOT", "/monthly-inbox-bot")
-    root = root.rstrip("/")
-    return Paths(
-        root=root,
-        stage00=f"{root}/00_inbox_raw",
-        stage10=f"{root}/10_preformat_py",
-        logs=f"{root}/logs",
-    )
+def build_paths_from_env() -> Paths:
+    """
+    Use the secrets already defined in monthly.yml:
+      MONTHLY_INBOX_PATH, MONTHLY_PREP_DIR, MONTHLY_OVERVIEW_DIR
+    """
+    stage00 = _need_env("MONTHLY_INBOX_PATH").rstrip("/")
+    stage10 = _need_env("MONTHLY_PREP_DIR").rstrip("/")
+    logs = _need_env("MONTHLY_OVERVIEW_DIR").rstrip("/")
+    return Paths(stage00=stage00, stage10=stage10, logs=logs)
 
 
 def list_stage00_xlsx(dbx: DropboxIO, stage00: str) -> List[Dict[str, Any]]:
-    # DropboxIO 側の list_folder API に合わせて実装してください
-    # ここでは “返り値が dict の配列（path, name, rev など）” を想定
+    """
+    DropboxIO.list_folder should return list[dict] where each dict has at least:
+      - name
+      - path OR path_display (optional)
+    """
     files = dbx.list_folder(stage00)
-    out = []
-    for it in files:
-        name = it.get("name", "")
+    out: List[Dict[str, Any]] = []
+    for it in files or []:
+        name = (it.get("name") or "")
         if name.lower().endswith(".xlsx") and not name.startswith("~$"):
             out.append(it)
     return out
 
 
-def main() -> int:
-    paths = build_paths()
-    run_id = now_jst_str()
+def _best_path(it: Dict[str, Any], fallback_dir: str) -> str:
+    # Prefer explicit path fields if present
+    for k in ("path", "path_display", "path_lower"):
+        p = it.get(k)
+        if p:
+            return p
+    # Fallback: compose from dir + name
+    nm = it.get("name") or "input.xlsx"
+    return f"{fallback_dir.rstrip('/')}/{nm}"
 
-    log_path_local = f"/tmp/monthly_{run_id}.jsonl"  # まずローカルに吐く
-    started = {
+
+def main() -> int:
+    run_id = now_jst_str()
+    log_path_local = f"/tmp/monthly_{run_id}.jsonl"
+
+    # 1) paths
+    try:
+        paths = build_paths_from_env()
+    except Exception as e:
+        # Make sure we see this in Actions logs
+        print(f"[monthly_main] FATAL: invalid env/paths: {e!r}", file=sys.stderr)
+        # also write a small local log
+        log_event(log_path_local, {
+            "ts": datetime.now(JST).isoformat(),
+            "run_id": run_id,
+            "stage": "bootstrap",
+            "level": "fatal",
+            "error": repr(e),
+        })
+        # show the local log content
+        try:
+            with open(log_path_local, "r", encoding="utf-8") as f:
+                print("[monthly_main] local log:", file=sys.stderr)
+                print(f.read(), file=sys.stderr)
+        except Exception:
+            pass
+        return 1
+
+    log_event(log_path_local, {
         "ts": datetime.now(JST).isoformat(),
         "run_id": run_id,
         "stage": "bootstrap",
         "msg": "start",
         "paths": paths.__dict__,
-    }
-    log_event(log_path_local, started)
+    })
 
-    # Dropbox 接続（既存の env を使う想定）
-    dbx = DropboxIO.from_env()
+    # 2) dropbox connect
+    try:
+        dbx = DropboxIO.from_env()
+    except Exception as e:
+        print(f"[monthly_main] FATAL: DropboxIO.from_env() failed: {e!r}", file=sys.stderr)
+        log_event(log_path_local, {
+            "ts": datetime.now(JST).isoformat(),
+            "run_id": run_id,
+            "stage": "bootstrap",
+            "level": "fatal",
+            "error": repr(e),
+        })
+        return 1
 
-    # 00 を列挙
+    # 3) list input files
     try:
         inputs = list_stage00_xlsx(dbx, paths.stage00)
         log_event(log_path_local, {
@@ -97,32 +142,49 @@ def main() -> int:
             "files": [x.get("name") for x in inputs],
         })
     except Exception as e:
+        # IMPORTANT: print so Actions shows the real reason
+        print(f"[monthly_main] ERROR: listing stage00 failed. stage00={paths.stage00!r} err={e!r}", file=sys.stderr)
         log_event(log_path_local, {
             "ts": datetime.now(JST).isoformat(),
             "run_id": run_id,
             "stage": "00_list",
             "level": "error",
+            "stage00": paths.stage00,
             "error": repr(e),
         })
-        dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
+        # Try to upload the log so you can see it on Dropbox too
+        try:
+            dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
+        except Exception as up_e:
+            print(f"[monthly_main] WARN: failed to upload log to Dropbox: {up_e!r}", file=sys.stderr)
+        # Also print the local log content
+        try:
+            with open(log_path_local, "r", encoding="utf-8") as f:
+                print("[monthly_main] local log:", file=sys.stderr)
+                print(f.read(), file=sys.stderr)
+        except Exception:
+            pass
         return 1
 
     if not inputs:
-        # 何もなければログだけ残して終了
-        dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
+        # nothing to do; still upload log
+        try:
+            dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
+        except Exception as e:
+            print(f"[monthly_main] WARN: upload log failed (no inputs): {e!r}", file=sys.stderr)
         return 0
 
-    # 00 -> 10 へコピー（加工はしない）
+    # 4) copy xlsx -> preformat folder
     processed = 0
     for it in inputs:
-        src_path = it.get("path") or it.get("path_display") or f"{paths.stage00}/{it.get('name')}"
-        src_name = it.get("name", "input.xlsx")
+        src_path = _best_path(it, paths.stage00)
+        src_name = it.get("name") or "input.xlsx"
+
         base = safe_name(os.path.splitext(src_name)[0])
         dst_name = f"{base}__preformat.xlsx"
         dst_path = f"{paths.stage10}/{dst_name}"
 
         try:
-            # DropboxIO に “copy” がなければ download->upload でもOK
             if hasattr(dbx, "copy"):
                 dbx.copy(src_path, dst_path)
             else:
@@ -139,6 +201,7 @@ def main() -> int:
                 "status": "ok",
             })
         except Exception as e:
+            print(f"[monthly_main] ERROR: copy failed src={src_path!r} dst={dst_path!r} err={e!r}", file=sys.stderr)
             log_event(log_path_local, {
                 "ts": datetime.now(JST).isoformat(),
                 "run_id": run_id,
@@ -149,14 +212,13 @@ def main() -> int:
                 "error": repr(e),
             })
 
-    # ログをDropboxへ保存（最重要）
+    # 5) upload run log
     try:
         dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
     except Exception as e:
-        # ここで失敗しても処理自体は終わっているので終了コードは 0 に寄せる（お好みで1でもOK）
-        pass
+        print(f"[monthly_main] WARN: failed to upload run log: {e!r}", file=sys.stderr)
 
-    return 0 if processed > 0 else 0
+    return 0
 
 
 if __name__ == "__main__":
