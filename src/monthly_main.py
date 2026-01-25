@@ -16,10 +16,10 @@ JST = timezone(timedelta(hours=9))
 
 @dataclass(frozen=True)
 class Paths:
-    stage00: str  # input xlsx folder on Dropbox
-    stage10: str  # preformat output folder on Dropbox
-    logs: str     # logs folder on Dropbox
-    outbox: str   # archive/output folder on Dropbox
+    stage00: str
+    stage10: str
+    logs: str
+    outbox: str
 
 
 def now_jst_str() -> str:
@@ -52,26 +52,28 @@ def _norm_path(p: str) -> str:
         return p
     if not p.startswith("/"):
         p = "/" + p
-    # remove trailing slash (except root "/")
     if len(p) > 1:
         p = p.rstrip("/")
     return p
 
 
-def _candidate_paths(raw: str, app_folder_name: str) -> List[str]:
+def _app_prefixes(app_folder_name: str) -> List[str]:
     """
-    Make Dropbox path candidates that work for BOTH:
-      - App folder scoped token: "/00_inbox_raw"
-      - Full Dropbox token: "/Apps/<app>/00_inbox_raw"
+    Try both English and Japanese 'Apps' folder roots just in case.
+    (Dropbox UI may show アプリ; API is usually /Apps, but we try both.)
+    """
+    app_folder_name = (app_folder_name or "").strip() or "monthly-inbox-bot"
+    return [
+        f"/Apps/{app_folder_name}",
+        f"/アプリ/{app_folder_name}",
+    ]
 
-    If raw already includes /Apps/<app>, we also try stripping it.
-    If raw does NOT include it, we also try adding it.
-    """
+
+def _candidate_paths(raw: str, app_folder_name: str) -> List[str]:
     raw = _norm_path(raw)
     if not raw:
         return []
 
-    app_prefix = f"/Apps/{app_folder_name}"
     candidates: List[str] = []
 
     def add(x: str) -> None:
@@ -82,25 +84,22 @@ def _candidate_paths(raw: str, app_folder_name: str) -> List[str]:
     # as-is
     add(raw)
 
-    # add prefix (full-dropbox style)
-    if not raw.startswith(app_prefix + "/") and raw != app_prefix:
-        add(app_prefix + raw)
+    # add prefixes (full-dropbox style)
+    for pref in _app_prefixes(app_folder_name):
+        if not raw.startswith(pref + "/") and raw != pref:
+            add(pref + raw)
 
-    # strip prefix (app-folder style)
-    if raw.startswith(app_prefix + "/"):
-        add(raw[len(app_prefix):])
-    elif raw == app_prefix:
-        add("/")
+    # strip prefixes (app-folder style)
+    for pref in _app_prefixes(app_folder_name):
+        if raw.startswith(pref + "/"):
+            add(raw[len(pref):])
+        elif raw == pref:
+            add("/")
 
     return candidates
 
 
 def _exists_folder_by_list(dbx: DropboxIO, path: str) -> Tuple[bool, Optional[str]]:
-    """
-    Best-effort "folder exists" check.
-    We call list_folder(path). If it raises "folder not found", treat as absent.
-    Return (exists, error_repr_if_any)
-    """
     try:
         dbx.list_folder(path)
         return True, None
@@ -108,27 +107,42 @@ def _exists_folder_by_list(dbx: DropboxIO, path: str) -> Tuple[bool, Optional[st
         return False, repr(e)
 
 
+def _try_list_root(dbx: DropboxIO) -> Dict[str, Any]:
+    """
+    Print what the token can see at root.
+    This is the single most important diagnostic for 'folder not found'.
+    """
+    out: Dict[str, Any] = {"attempts": []}
+
+    for p in ("", "/", "/Apps", "/アプリ"):
+        try:
+            items = dbx.list_folder(p)
+            # keep it small and safe
+            names = []
+            for it in (items or [])[:50]:
+                nm = it.get("name") or it.get("path_display") or it.get("path") or ""
+                if nm:
+                    names.append(nm)
+            out["attempts"].append({"path": p, "ok": True, "count": len(items or []), "sample": names})
+        except Exception as e:
+            out["attempts"].append({"path": p, "ok": False, "err": repr(e)})
+
+    return out
+
+
 def resolve_paths_or_die(dbx: DropboxIO) -> Paths:
-    """
-    Resolve Dropbox folder paths from env, with robust fallback to handle
-    App-folder vs Full-dropbox path conventions.
-    """
     stage00_raw = _need_env("MONTHLY_INBOX_PATH")
     stage10_raw = _need_env("MONTHLY_PREP_DIR")
     logs_raw = _need_env("MONTHLY_OVERVIEW_DIR")
     outbox_raw = _need_env("MONTHLY_OUTBOX_DIR")
 
-    # default app folder name (matches your Dropbox folder)
     app_folder_name = os.environ.get("DROPBOX_APP_FOLDER_NAME", "monthly-inbox-bot").strip() or "monthly-inbox-bot"
 
-    # build candidates
     c_stage00 = _candidate_paths(stage00_raw, app_folder_name)
     c_stage10 = _candidate_paths(stage10_raw, app_folder_name)
     c_logs = _candidate_paths(logs_raw, app_folder_name)
     c_outbox = _candidate_paths(outbox_raw, app_folder_name)
 
-    # pick first existing
-    resolved: Dict[str, str] = {}
     debug: Dict[str, Any] = {
         "app_folder_name": app_folder_name,
         "candidates": {
@@ -142,7 +156,8 @@ def resolve_paths_or_die(dbx: DropboxIO) -> Paths:
             "stage10": [],
             "logs": [],
             "outbox": [],
-        }
+        },
+        "root_listing": _try_list_root(dbx),
     }
 
     def pick(key: str, cands: List[str]) -> str:
@@ -154,31 +169,20 @@ def resolve_paths_or_die(dbx: DropboxIO) -> Paths:
         raise RuntimeError(f"Dropbox folder not found ({key}): {cands[0] if cands else '(empty)'}")
 
     try:
-        resolved["stage00"] = pick("stage00", c_stage00)
-        resolved["stage10"] = pick("stage10", c_stage10)
-        resolved["logs"] = pick("logs", c_logs)
-        resolved["outbox"] = pick("outbox", c_outbox)
+        stage00 = pick("stage00", c_stage00)
+        stage10 = pick("stage10", c_stage10)
+        logs = pick("logs", c_logs)
+        outbox = pick("outbox", c_outbox)
     except Exception as e:
-        # Print detailed diagnostics in Actions logs (safe: only paths, no tokens)
         print(f"[monthly_main] FATAL: resolve paths failed: {e!r}", file=sys.stderr)
-        print("[monthly_main] resolve debug (path candidates + existence checks):", file=sys.stderr)
+        print("[monthly_main] resolve debug (includes root listing):", file=sys.stderr)
         print(json.dumps(debug, ensure_ascii=False, indent=2), file=sys.stderr)
         raise
 
-    return Paths(
-        stage00=resolved["stage00"],
-        stage10=resolved["stage10"],
-        logs=resolved["logs"],
-        outbox=resolved["outbox"],
-    )
+    return Paths(stage00=stage00, stage10=stage10, logs=logs, outbox=outbox)
 
 
 def list_stage00_xlsx(dbx: DropboxIO, stage00: str) -> List[Dict[str, Any]]:
-    """
-    DropboxIO.list_folder should return list[dict] where each dict has at least:
-      - name
-      - path OR path_display (optional)
-    """
     files = dbx.list_folder(stage00)
     out: List[Dict[str, Any]] = []
     for it in files or []:
@@ -201,7 +205,6 @@ def main() -> int:
     run_id = now_jst_str()
     log_path_local = f"/tmp/monthly_{run_id}.jsonl"
 
-    # 1) connect dropbox
     try:
         dbx = DropboxIO.from_env()
     except Exception as e:
@@ -215,7 +218,6 @@ def main() -> int:
         })
         return 1
 
-    # 2) resolve paths robustly
     try:
         paths = resolve_paths_or_die(dbx)
     except Exception as e:
@@ -236,7 +238,6 @@ def main() -> int:
         "paths": paths.__dict__,
     })
 
-    # 3) list input files
     try:
         inputs = list_stage00_xlsx(dbx, paths.stage00)
         log_event(log_path_local, {
@@ -256,26 +257,19 @@ def main() -> int:
             "stage00": paths.stage00,
             "error": repr(e),
         })
-        try:
-            dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
-        except Exception as up_e:
-            print(f"[monthly_main] WARN: failed to upload log to Dropbox: {up_e!r}", file=sys.stderr)
         return 1
 
     if not inputs:
-        # nothing to do; still upload log
         try:
             dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
         except Exception as e:
             print(f"[monthly_main] WARN: upload log failed (no inputs): {e!r}", file=sys.stderr)
         return 0
 
-    # 4) copy xlsx -> preformat folder
     processed = 0
     for it in inputs:
         src_path = _best_path(it, paths.stage00)
         src_name = it.get("name") or "input.xlsx"
-
         base = safe_name(os.path.splitext(src_name)[0])
         dst_name = f"{base}__preformat.xlsx"
         dst_path = f"{paths.stage10}/{dst_name}"
@@ -308,13 +302,11 @@ def main() -> int:
                 "error": repr(e),
             })
 
-    # 5) upload run log
     try:
         dbx.upload_file(log_path_local, f"{paths.logs}/run_{run_id}.jsonl")
     except Exception as e:
         print(f"[monthly_main] WARN: failed to upload run log: {e!r}", file=sys.stderr)
 
-    # If at least one file processed, success
     return 0 if processed > 0 else 0
 
 
