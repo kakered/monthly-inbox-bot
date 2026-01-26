@@ -1,59 +1,130 @@
 # -*- coding: utf-8 -*-
 """
-excel_exporter.py
+src/excel_exporter.py
 
-目的:
-- monthly_pipeline_MULTISTAGE.py から import されるエントリポイント
-  `process_monthly_workbook` を提供する。
-- まずはパイプラインを止めない「安全な暫定実装」。
-  (破壊的操作なし / 例外を握りつぶさずログして継続)
+Purpose
+- Provide process_monthly_workbook() that monthly_pipeline_MULTISTAGE imports.
+- Be tolerant to different calling conventions (bytes / in_path+out_path / args+kwargs).
+- For now: "pass-through + light normalization" (no OpenAI calls here).
+  It loads an .xlsx, ensures it is a valid workbook, and writes it back.
 
-注意:
-- ここではExcelの変換・書き戻しなどの本処理は行いません。
-- 本実装は、次のエラー地点や必要I/O(入力/出力)が確定してから追加します。
+This file is intentionally defensive: it prevents pipeline crashes even if workbook is empty,
+sheet names vary, or caller passes args in unexpected forms.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
+
+from openpyxl import load_workbook
+from openpyxl.workbook.workbook import Workbook
+
+
+PathLike = Union[str, Path]
 
 
 @dataclass
-class ExcelProcessResult:
-    """将来拡張用の戻り値コンテナ（暫定）。"""
+class ExportResult:
     ok: bool
-    message: str = ""
-    details: Optional[Dict[str, Any]] = None
+    message: str
+    rows_processed: int = 0
+    sheets: int = 0
 
 
-def process_monthly_workbook(*args: Any, **kwargs: Any) -> ExcelProcessResult:
+def _load_wb_from_bytes(data: bytes) -> Workbook:
+    bio = BytesIO(data)
+    wb = load_workbook(bio)
+    return wb
+
+
+def _save_wb_to_bytes(wb: Workbook) -> bytes:
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _coerce_paths_from_args_kwargs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Optional[PathLike], Optional[PathLike]]:
     """
-    Safe no-op entrypoint.
-
-    想定:
-      monthly_pipeline_MULTISTAGE.stage2_api から呼ばれる。
-      ただし現時点で呼び出しシグネチャが確定していないため、
-      *args/**kwargs で受けて落ちないようにする。
-
-    方針:
-      - ここで例外を投げてパイプライン全体を止めない。
-      - ただし「黙って成功」に見せるとデバッグが難しくなるので、
-        何を受け取ったかを最低限返す。
+    Try to find input/output path candidates from arbitrary args/kwargs.
     """
-    # 受け取った引数の形だけ返す（ログ代わり）
+    in_keys = ("in_path", "input_path", "src_path", "xlsx_path", "path", "local_path")
+    out_keys = ("out_path", "output_path", "dst_path", "dest_path", "save_path")
+
+    in_path = None
+    out_path = None
+
+    for k in in_keys:
+        if k in kwargs and isinstance(kwargs[k], (str, Path)):
+            in_path = kwargs[k]
+            break
+
+    for k in out_keys:
+        if k in kwargs and isinstance(kwargs[k], (str, Path)):
+            out_path = kwargs[k]
+            break
+
+    # If not in kwargs, infer from positional args
+    # Common patterns:
+    #   process_monthly_workbook(in_path, out_path, ...)
+    #   process_monthly_workbook(in_path, ...)
+    if in_path is None and len(args) >= 1 and isinstance(args[0], (str, Path)):
+        in_path = args[0]
+    if out_path is None and len(args) >= 2 and isinstance(args[1], (str, Path)):
+        out_path = args[1]
+
+    return in_path, out_path
+
+
+def process_monthly_workbook(*args: Any, **kwargs: Any) -> Union[bytes, ExportResult, Dict[str, Any]]:
+    """
+    Main entrypoint imported by monthly_pipeline_MULTISTAGE.py.
+
+    Supported call styles (tolerant):
+    1) bytes -> bytes
+       out_bytes = process_monthly_workbook(xlsx_bytes)
+
+    2) file path(s) -> ExportResult
+       res = process_monthly_workbook("in.xlsx", "out.xlsx")
+
+    3) kwargs variants:
+       res = process_monthly_workbook(in_path="in.xlsx", out_path="out.xlsx")
+
+    If output path is not provided, it will overwrite the input path (safe default for pipeline temp files).
+    """
+    # Case A: first arg is bytes
+    if len(args) >= 1 and isinstance(args[0], (bytes, bytearray)):
+        data = bytes(args[0])
+        wb = _load_wb_from_bytes(data)
+        # minimal normalization hook (no-op for now)
+        return _save_wb_to_bytes(wb)
+
+    in_path, out_path = _coerce_paths_from_args_kwargs(args, kwargs)
+
+    if in_path is None:
+        # Nothing we can do; return a structured result rather than crashing.
+        return ExportResult(ok=False, message="No input workbook provided (no bytes and no in_path).")
+
+    in_p = Path(in_path)
+    if out_path is None:
+        out_p = in_p  # overwrite
+    else:
+        out_p = Path(out_path)
+
+    if not in_p.exists():
+        return ExportResult(ok=False, message=f"Input workbook not found on local FS: {in_p}")
+
     try:
-        arg_types = [type(a).__name__ for a in args]
-        kw_keys = sorted(list(kwargs.keys()))
-        msg = (
-            "[excel_exporter] noop (placeholder). "
-            f"args={len(args)} types={arg_types} kwargs_keys={kw_keys}"
-        )
-        return ExcelProcessResult(
-            ok=True,
-            message=msg,
-            details={"args_len": len(args), "arg_types": arg_types, "kwargs_keys": kw_keys},
-        )
+        wb = load_workbook(in_p)
+        sheets = len(wb.sheetnames)
+
+        # minimal "touch": ensure workbook is writable by saving it.
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(out_p)
+
+        return ExportResult(ok=True, message="Workbook exported (pass-through).", rows_processed=0, sheets=sheets)
+
     except Exception as e:
-        # ここで落ちるのは最悪なので、失敗結果として返す
-        return ExcelProcessResult(ok=False, message=f"[excel_exporter] failed: {e!r}", details=None)
+        return ExportResult(ok=False, message=f"Failed to process workbook: {e!r}")
