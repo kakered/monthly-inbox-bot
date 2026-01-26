@@ -1,350 +1,332 @@
 # -*- coding: utf-8 -*-
-"""
-monthly_pipeline_MULTISTAGE.py
-
-Multi-stage monthly report pipeline.
-
-Stages (intended):
-  STAGE1: Build "prep" workbook (API前の整形). Creates blank feedback columns.
-  STAGE2: Run API on prep workbook -> overview/per_person outputs (existing excel_exporter).
-  (Future) STAGE3/4/5: accumulation & comparisons.
-
-This file is designed to be *compatible* with the existing repository modules:
-- src.dropbox_io.DropboxIO
-- src.state_store.StateStore
-- src.excel_exporter.process_monthly_workbook
-
-Notes:
-- This pipeline intentionally uses StateStore.save(dbx) / StateStore.load(dbx, path)
-- DropboxIO must provide: list_folder(), download_to_bytes(), upload_bytes()/write_file_bytes()
-"""
-
 from __future__ import annotations
 
+import json
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime
-from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
-
-import openpyxl
-from openpyxl.utils.datetime import from_excel
+from typing import Dict, List, Optional, Tuple
 
 from .dropbox_io import DropboxIO
-from .state_store import StateStore
+from .excel_exporter import process_monthly_workbook
 
 
-# ---------------------------
-# Config
-# ---------------------------
+def _ts() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _norm(p: str) -> str:
+    p = (p or "").strip()
+    if p == "/":
+        return ""
+    if p == "":
+        return ""
+    if not p.startswith("/"):
+        p = "/" + p
+    if len(p) > 1 and p.endswith("/"):
+        p = p[:-1]
+    return p
+
+
+def _sibling(p: str, leaf_from: str, leaf_to: str) -> str:
+    """
+    Replace last path segment if it matches leaf_from.
+    e.g. /00_inbox_raw/IN -> /00_inbox_raw/DONE
+    """
+    p = _norm(p)
+    if p == "":
+        return p
+    parts = p.split("/")
+    if parts[-1] == leaf_from:
+        parts[-1] = leaf_to
+    return "/".join(parts)
+
+
+def _join(a: str, b: str) -> str:
+    a = _norm(a)
+    b = (b or "").strip().lstrip("/")
+    if a == "":
+        return "/" + b if b else ""
+    return a + ("/" + b if b else "")
+
 
 @dataclass
-class MonthlyMultiStageConfig:
-    # Dropbox paths
-    inbox_path: str = "/0-Inbox/monthlyreports"
-    prep_out_dir: str = "/0-System/monthly_pipeline/prep"
-    outbox_monthly_dir: str = "/0-Outbox/monthly"           # legacy (overview+per_person in one folder)
-    outbox_overview_dir: str = "/0-Outbox/monthly_overview" # overview-only
-    state_path: str = "/0-System/state.json"
-
-    # Controls
-    max_files_per_run: int = 1
+class Cfg:
+    inbox_in: str
+    prep_in: str
+    overview_in: str
+    outbox_in: str
+    logs_dir: str
+    state_path: str
+    max_files: int
 
     @classmethod
-    def from_env(cls) -> "MonthlyMultiStageConfig":
+    def from_env(cls) -> "Cfg":
+        inbox_in = os.getenv("MONTHLY_INBOX_PATH", "/00_inbox_raw/IN")
+        prep_in = os.getenv("MONTHLY_PREP_DIR", "/10_preformat_py/IN")
+        overview_in = os.getenv("MONTHLY_OVERVIEW_DIR", "/20_overview_api/IN")
+        outbox_in = os.getenv("MONTHLY_OUTBOX_DIR", "/30_personalize_py/IN")
+        logs_dir = os.getenv("LOGS_DIR", "/_system/logs")
+        state_path = os.getenv("STATE_PATH", "/_system/state.json")
+        max_files = int(os.getenv("MAX_FILES_PER_RUN", "200"))
         return cls(
-            inbox_path=os.getenv("MONTHLY_INBOX_PATH", "/0-Inbox/monthlyreports"),
-            prep_out_dir=os.getenv("MONTHLY_PREP_DIR", "/0-System/monthly_pipeline/prep"),
-            outbox_monthly_dir=os.getenv("MONTHLY_OUTBOX_DIR", "/0-Outbox/monthly"),
-            outbox_overview_dir=os.getenv("MONTHLY_OVERVIEW_DIR", "/0-Outbox/monthly_overview"),
-            state_path=os.getenv("STATE_PATH", "/0-System/state.json"),
-            max_files_per_run=int(os.getenv("MONTHLY_MAX_FILES", "1")),
+            inbox_in=_norm(inbox_in),
+            prep_in=_norm(prep_in),
+            overview_in=_norm(overview_in),
+            outbox_in=_norm(outbox_in),
+            logs_dir=_norm(logs_dir),
+            state_path=_norm(state_path),
+            max_files=max_files,
         )
 
 
-# ---------------------------
-# Helpers: parsing input excel
-# ---------------------------
-
-# Input sheet expected: "月報"
-INPUT_SHEET_NAME = "月報"
-
-# Output sheet expected: "Sheet1" (matches provided xltx template)
-OUTPUT_SHEET_NAME = "Sheet1"
-
-# Mapping: input columns -> output "fulltext" columns.
-# The *feedback* columns are created as empty strings.
-# 最新仕様: 社員番号/一致確認用/就業先 は出力に残さない
-OUTPUT_COLUMNS = [
-    "Month",
-    "Person_ID",
-    "人間関係（報連相）_FullText",
-    "人間関係（報連相）_Draft_Feedback",
-    "仕事の量・質_FullText",
-    "仕事の量・質_Draft_Feedback",
-    "積極性_FullText",
-    "積極性_Draft_Feedback",
-    "責任性_FullText",
-    "責任性_Draft_Feedback",
-    "ヒヤリハットの抽出・分析・対策_FullText",
-    "ヒヤリハットの抽出・分析・対策_Draft_Feedback",
-    "就業先での業務改善提案_FullText",
-    "就業先での業務改善提案_Draft_Feedback",
-    "本社への相談・要望_FullText",
-    "本社への相談・要望_Draft_Feedback",
-]
-
-INPUT_TO_OUTPUT_FULLTEXT = {
-    "人間関係（報連相）": "人間関係（報連相）_FullText",
-    "仕事の量・質": "仕事の量・質_FullText",
-    "積極性": "積極性_FullText",
-    "責任性": "責任性_FullText",
-    "ヒヤリハットの抽出・分析・対策": "ヒヤリハットの抽出・分析・対策_FullText",
-    "就業先での業務改善提案": "就業先での業務改善提案_FullText",
-    "本社への相談・要望": "本社への相談・要望_FullText",
-}
-
-FEEDBACK_COLUMNS = [c for c in OUTPUT_COLUMNS if c.endswith("_Draft_Feedback")]
-
-
-def _excel_month_to_str(v: Any) -> str:
-    """
-    Input '対象月' may be:
-      - datetime/date
-      - Excel serial (int/float)
-      - string
-    Output: 'YYYY-MM' (string)
-    """
-    if v is None:
-        return "unknown-month"
-    if isinstance(v, str):
-        s = v.strip()
-        # try normalize like '2025/09' or '2025-09'
-        m = re.search(r"(\d{4})[/-](\d{1,2})", s)
-        if m:
-            return f"{m.group(1)}-{int(m.group(2)):02d}"
-        return s or "unknown-month"
-    # datetime/date
+def _load_state(dbx: DropboxIO, path: str) -> Dict:
+    raw = dbx.read_json_bytes_or_none(path)
+    if not raw:
+        return {}
     try:
-        import datetime as _dt
-        if isinstance(v, (_dt.datetime, _dt.date)):
-            y = v.year
-            m = v.month
-            return f"{y:04d}-{m:02d}"
+        return json.loads(raw.decode("utf-8"))
     except Exception:
-        pass
-    # excel serial
-    if isinstance(v, (int, float)):
-        try:
-            dt = from_excel(v)
-            return f"{dt.year:04d}-{dt.month:02d}"
-        except Exception:
-            return str(v)
-    return str(v)
+        return {}
 
 
-def _read_input_rows(xlsx_bytes: bytes) -> List[Dict[str, Any]]:
-    wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), data_only=True)
-    if INPUT_SHEET_NAME not in wb.sheetnames:
-        raise ValueError(f"Input workbook has no sheet '{INPUT_SHEET_NAME}'. sheets={wb.sheetnames}")
-    ws = wb[INPUT_SHEET_NAME]
-
-    # header row = 1
-    headers = []
-    for c in range(1, ws.max_column + 1):
-        headers.append(ws.cell(1, c).value)
-
-    # build list of dict rows
-    rows: List[Dict[str, Any]] = []
-    for r in range(2, ws.max_row + 1):
-        row = {}
-        empty = True
-        for c, h in enumerate(headers, start=1):
-            if h is None or h == "":
-                continue
-            val = ws.cell(r, c).value
-            if val not in (None, ""):
-                empty = False
-            row[str(h)] = val
-        if not empty:
-            rows.append(row)
-    return rows
+def _save_state(dbx: DropboxIO, path: str, state: Dict) -> None:
+    data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
+    dbx.ensure_folder(os.path.dirname(path) or "/_system")
+    dbx.upload_bytes(path, data)
 
 
-def _make_prep_workbook(rows: List[Dict[str, Any]]) -> Tuple[bytes, str]:
+def _pick_xlsx_files(dbx: DropboxIO, folder: str, max_files: int) -> List[Tuple[str, str, str]]:
     """
-    Create 'prep' workbook for API.
-    Returns (xlsx_bytes, month_str).
+    return list of (path, name, rev)
     """
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = OUTPUT_SHEET_NAME
-
-    # header
-    for col_idx, name in enumerate(OUTPUT_COLUMNS, start=1):
-        ws.cell(1, col_idx).value = name
-
-    month_str = "unknown-month"
-
-    for i, r in enumerate(rows, start=2):
-        # Month
-        m = _excel_month_to_str(r.get("対象月"))
-        month_str = month_str if month_str != "unknown-month" else m
-        ws.cell(i, 1).value = m
-
-        # Person_ID
-        ws.cell(i, 2).value = r.get("ID")
-
-        # FullText columns
-        out_map: Dict[str, Any] = {}
-        for in_col, out_col in INPUT_TO_OUTPUT_FULLTEXT.items():
-            out_map[out_col] = r.get(in_col)
-
-        # write fulltext + feedback blanks
-        for col_idx, name in enumerate(OUTPUT_COLUMNS, start=1):
-            if name in out_map:
-                ws.cell(i, col_idx).value = out_map[name]
-            elif name in FEEDBACK_COLUMNS:
-                ws.cell(i, col_idx).value = ""  # blank for API fill
-            # Month/Person_ID already written
-
-    # freeze header
-    ws.freeze_panes = "A2"
-
-    out = BytesIO()
-    wb.save(out)
-    return out.getvalue(), month_str
+    items = dbx.list_folder(folder)
+    out: List[Tuple[str, str, str]] = []
+    for it in items:
+        name = getattr(it, "name", None)
+        if not isinstance(name, str):
+            continue
+        low = name.lower()
+        if not (low.endswith(".xlsx") or low.endswith(".xlsm") or low.endswith(".xls")):
+            continue
+        path = getattr(it, "path_display", None) or getattr(it, "path_lower", None)
+        if not isinstance(path, str):
+            continue
+        rev = getattr(it, "rev", "") or ""
+        out.append((path, name, rev))
+        if len(out) >= max_files:
+            break
+    return out
 
 
-# ---------------------------
-# Stage1 / Stage2
-# ---------------------------
+def _stage_folders(in_path: str) -> Tuple[str, str, str]:
+    """
+    Given /XX_xxx/IN -> returns (IN, DONE, OUT) sibling folders
+    """
+    in_path = _norm(in_path)
+    done_path = _sibling(in_path, "IN", "DONE")
+    out_path = _sibling(in_path, "IN", "OUT")
+    return in_path, done_path, out_path
 
-def stage1_prep(dbx: DropboxIO, state: StateStore, cfg: MonthlyMultiStageConfig) -> None:
-    items = dbx.list_folder(cfg.inbox_path)
 
-    # filter xlsx only
-    xlsx_items = [it for it in items if (getattr(it, "name", "") or "").lower().endswith(".xlsx")]
-    if not xlsx_items:
-        return
+def stage00_raw_to_prep(dbx: DropboxIO, cfg: Cfg, state: Dict) -> int:
+    """
+    00/IN から Excel を取り込み、加工済み(placeholder)を 10/IN へ出す。
+    入力は 00/DONE へ move。
+    """
+    s_in, s_done, _ = _stage_folders(cfg.inbox_in)
+    t_in, _, _ = _stage_folders(cfg.prep_in)
 
-    # cap
-    xlsx_items = xlsx_items[: cfg.max_files_per_run]
+    dbx.ensure_folder(s_in)
+    dbx.ensure_folder(s_done)
+    dbx.ensure_folder(t_in)
 
-    for it in xlsx_items:
-        src_path = getattr(it, "path", None) or getattr(it, "path_lower", None)
-        if not src_path:
+    done_keys = set(state.get("stage00_done", []))
+
+    files = _pick_xlsx_files(dbx, s_in, cfg.max_files)
+    if not files:
+        print(f"[MONTHLY][00] No Excel under: {s_in}")
+        return 0
+
+    n = 0
+    for path, name, rev in files:
+        key = f"{path}::{rev}"
+        if key in done_keys:
             continue
 
-        key = (getattr(it, "path_lower", None) or src_path).lower()
+        print(f"[MONTHLY][00] process: {path} (rev={rev})")
+        xlsx_bytes = dbx.download_to_bytes(path)
 
-        if state.is_processed(key):
-            print(f"[MONTHLY][STAGE1] SKIP already processed: {src_path}")
-            continue
+        overview_bytes, per_person_bytes = process_monthly_workbook(xlsx_bytes=xlsx_bytes, password=None)
 
-        print(f"[MONTHLY][STAGE1] PREP: {src_path}")
-        raw = dbx.download_to_bytes(src_path)
-        rows = _read_input_rows(raw)
-        prep_bytes, month_str = _make_prep_workbook(rows)
+        stamp = _ts()
+        base = os.path.splitext(name)[0]
+        # 10/IN に「加工結果」2種を置く（必要なら後で1種に統合も可）
+        out_over = f"{base}__00to10__overview__rev-{rev}__{stamp}.xlsx"
+        out_per = f"{base}__00to10__per_person__rev-{rev}__{stamp}.xlsx"
 
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        prep_name = f"{getattr(it, 'name', 'monthly.xlsx')}__prep__{ts}.xlsx"
-        prep_path = f"{cfg.prep_out_dir}/{prep_name}"
+        dbx.upload_bytes(_join(t_in, out_over), overview_bytes)
+        dbx.upload_bytes(_join(t_in, out_per), per_person_bytes)
 
-        dbx.write_file_bytes(prep_path, prep_bytes)
-        print(f"[MONTHLY][STAGE1] Wrote: {prep_path}")
+        # move input to DONE
+        dbx.move(path, _join(s_done, f"{base}__rev-{rev}__{stamp}.xlsx"), overwrite=True)
 
-        state.mark_processed(key, rev=None)
-        state.save(dbx)
+        done_keys.add(key)
+        n += 1
 
-
-def _iter_prep_files(dbx: DropboxIO, cfg: MonthlyMultiStageConfig) -> List[Any]:
-    items = dbx.list_folder(cfg.prep_out_dir)
-    return [it for it in items if getattr(it, "name", "").lower().endswith(".xlsx")]
+    state["stage00_done"] = sorted(done_keys)
+    return n
 
 
-def _infer_month_from_prep_bytes(prep_bytes: bytes) -> str:
-    try:
-        wb = openpyxl.load_workbook(BytesIO(prep_bytes), data_only=True)
-        ws = wb[OUTPUT_SHEET_NAME] if OUTPUT_SHEET_NAME in wb.sheetnames else wb.active
-        # A2 should be Month
-        v = ws.cell(2, 1).value
-        return _excel_month_to_str(v)
-    except Exception:
-        return "unknown-month"
-
-
-def stage2_api(dbx: DropboxIO, state: StateStore, cfg: MonthlyMultiStageConfig) -> None:
-    from .excel_exporter import process_monthly_workbook
-
-    prep_files = _iter_prep_files(dbx, cfg)
-    if not prep_files:
-        return
-
-    for it in prep_files[: cfg.max_files_per_run]:
-        prep_path = getattr(it, "path", None) or getattr(it, "path_lower", None)
-        if not prep_path:
-            continue
-
-        key = (getattr(it, "path_lower", None) or prep_path).lower()
-        if state.is_processed(key):
-            # already API'd
-            continue
-
-        prep_bytes = dbx.download_to_bytes(prep_path)
-        month_str = _infer_month_from_prep_bytes(prep_bytes)
-
-        print(f"[MONTHLY][STAGE2] OVERVIEW_API: {prep_path}")
-        overview_bytes, per_person_bytes = process_monthly_workbook(
-            workbook_bytes=prep_bytes,
-            source_path=prep_path,
-        )
-
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-
-        # overview-only folder (current)
-        out_overview_path = f"{cfg.outbox_overview_dir}/{month_str}__overview__{ts}.xlsx"
-        dbx.write_file_bytes(out_overview_path, overview_bytes)
-        print(f"[MONTHLY][STAGE2] Wrote: {out_overview_path}")
-
-        # optional legacy outputs if per_person_bytes is present
-        if per_person_bytes:
-            out_per_person_path = f"{cfg.outbox_monthly_dir}/{month_str}__per_person__{ts}.xlsx"
-            dbx.write_file_bytes(out_per_person_path, per_person_bytes)
-            print(f"[MONTHLY][STAGE2] Wrote: {out_per_person_path}")
-
-        state.mark_processed(key, rev=None)
-        state.save(dbx)
-
-
-# ---------------------------
-# Runner
-# ---------------------------
-
-def run_multistage(dbx: Optional[DropboxIO] = None, cfg: Optional[MonthlyMultiStageConfig] = None) -> None:
+def stage10_prep_to_overview(dbx: DropboxIO, cfg: Cfg, state: Dict) -> int:
     """
-    Default behavior:
-      - STAGE1 then STAGE2 in same run (fast validation).
-    Control:
-      MONTHLY_STAGE=1 -> stage1 only
-      MONTHLY_STAGE=2 -> stage2 only
-      MONTHLY_STAGE=12 -> stage1 then stage2 (default)
+    10/IN から 20/IN へ"次段に回す"。
+    （ここは今はコピー/移動のみ。後でAPI処理に置換する場所）
     """
+    s_in, s_done, _ = _stage_folders(cfg.prep_in)
+    t_in, _, _ = _stage_folders(cfg.overview_in)
+
+    dbx.ensure_folder(s_in)
+    dbx.ensure_folder(s_done)
+    dbx.ensure_folder(t_in)
+
+    done_keys = set(state.get("stage10_done", []))
+
+    files = _pick_xlsx_files(dbx, s_in, cfg.max_files)
+    if not files:
+        print(f"[MONTHLY][10] No Excel under: {s_in}")
+        return 0
+
+    n = 0
+    for path, name, rev in files:
+        key = f"{path}::{rev}"
+        if key in done_keys:
+            continue
+
+        stamp = _ts()
+        base = os.path.splitext(name)[0]
+        print(f"[MONTHLY][10] forward: {path} (rev={rev})")
+
+        data = dbx.download_to_bytes(path)
+        dbx.upload_bytes(_join(t_in, f"{base}__10to20__rev-{rev}__{stamp}.xlsx"), data)
+
+        dbx.move(path, _join(s_done, f"{base}__rev-{rev}__{stamp}.xlsx"), overwrite=True)
+
+        done_keys.add(key)
+        n += 1
+
+    state["stage10_done"] = sorted(done_keys)
+    return n
+
+
+def stage20_overview_to_personalize(dbx: DropboxIO, cfg: Cfg, state: Dict) -> int:
+    """
+    20/IN から 30/IN へ回す（今は移送のみ）
+    """
+    s_in, s_done, _ = _stage_folders(cfg.overview_in)
+    t_in, _, _ = _stage_folders(cfg.outbox_in)
+
+    dbx.ensure_folder(s_in)
+    dbx.ensure_folder(s_done)
+    dbx.ensure_folder(t_in)
+
+    done_keys = set(state.get("stage20_done", []))
+
+    files = _pick_xlsx_files(dbx, s_in, cfg.max_files)
+    if not files:
+        print(f"[MONTHLY][20] No Excel under: {s_in}")
+        return 0
+
+    n = 0
+    for path, name, rev in files:
+        key = f"{path}::{rev}"
+        if key in done_keys:
+            continue
+
+        stamp = _ts()
+        base = os.path.splitext(name)[0]
+        print(f"[MONTHLY][20] forward: {path} (rev={rev})")
+
+        data = dbx.download_to_bytes(path)
+        dbx.upload_bytes(_join(t_in, f"{base}__20to30__rev-{rev}__{stamp}.xlsx"), data)
+
+        dbx.move(path, _join(s_done, f"{base}__rev-{rev}__{stamp}.xlsx"), overwrite=True)
+
+        done_keys.add(key)
+        n += 1
+
+    state["stage20_done"] = sorted(done_keys)
+    return n
+
+
+def stage30_finalize(dbx: DropboxIO, cfg: Cfg, state: Dict) -> int:
+    """
+    30/IN に来たものを 30/OUT に"完成物"として出す（今は同一コピー）。
+    入力は 30/DONE に移動。
+    """
+    s_in, s_done, s_out = _stage_folders(cfg.outbox_in)
+
+    dbx.ensure_folder(s_in)
+    dbx.ensure_folder(s_done)
+    dbx.ensure_folder(s_out)
+
+    done_keys = set(state.get("stage30_done", []))
+
+    files = _pick_xlsx_files(dbx, s_in, cfg.max_files)
+    if not files:
+        print(f"[MONTHLY][30] No Excel under: {s_in}")
+        return 0
+
+    n = 0
+    for path, name, rev in files:
+        key = f"{path}::{rev}"
+        if key in done_keys:
+            continue
+
+        stamp = _ts()
+        base = os.path.splitext(name)[0]
+        print(f"[MONTHLY][30] finalize: {path} (rev={rev})")
+
+        data = dbx.download_to_bytes(path)
+        dbx.upload_bytes(_join(s_out, f"{base}__FINAL__rev-{rev}__{stamp}.xlsx"), data)
+        dbx.move(path, _join(s_done, f"{base}__rev-{rev}__{stamp}.xlsx"), overwrite=True)
+
+        done_keys.add(key)
+        n += 1
+
+    state["stage30_done"] = sorted(done_keys)
+    return n
+
+
+def run_multistage(dbx: Optional[DropboxIO] = None, cfg: Optional[Cfg] = None) -> None:
     dbx = dbx or DropboxIO.from_env()
-    cfg = cfg or MonthlyMultiStageConfig.from_env()
+    cfg = cfg or Cfg.from_env()
 
-    state = StateStore.load(dbx, cfg.state_path)
+    # create system folders
+    dbx.ensure_folder(cfg.logs_dir)
+    dbx.ensure_folder(os.path.dirname(cfg.state_path) or "/_system")
 
-    stage = os.getenv("MONTHLY_STAGE", "12").strip()
+    stage = (os.getenv("MONTHLY_STAGE") or "00").strip()
+    state = _load_state(dbx, cfg.state_path)
 
-    if stage == "1":
-        stage1_prep(dbx, state, cfg)
-        return
-    if stage == "2":
-        stage2_api(dbx, state, cfg)
-        return
+    print(f"[MONTHLY] MONTHLY_STAGE={stage}")
+    print(f"[MONTHLY] inbox_in={cfg.inbox_in}")
+    print(f"[MONTHLY] prep_in={cfg.prep_in}")
+    print(f"[MONTHLY] overview_in={cfg.overview_in}")
+    print(f"[MONTHLY] outbox_in={cfg.outbox_in}")
+    print(f"[MONTHLY] logs_dir={cfg.logs_dir}")
+    print(f"[MONTHLY] state_path={cfg.state_path}")
 
-    # default: stage1 then stage2
-    stage1_prep(dbx, state, cfg)
-    stage2_api(dbx, state, cfg)
+    if stage == "00":
+        ran = stage00_raw_to_prep(dbx, cfg, state)
+    elif stage == "10":
+        ran = stage10_prep_to_overview(dbx, cfg, state)
+    elif stage == "20":
+        ran = stage20_overview_to_personalize(dbx, cfg, state)
+    elif stage == "30":
+        ran = stage30_finalize(dbx, cfg, state)
+    else:
+        raise RuntimeError("MONTHLY_STAGE must be one of: 00, 10, 20, 30")
+
+    _save_state(dbx, cfg.state_path, state)
+    print(f"[MONTHLY] stage={stage} processed={ran}")
