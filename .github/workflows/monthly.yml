@@ -1,22 +1,66 @@
-name: inbox-bot (monthly)
+name: Run monthly-report pipeline (Excel)
 
 on:
   workflow_dispatch:
-  # 例：毎月1日 09:15 JST 相当（UTCで 00:15）
-  # schedule:
-  #   - cron: "15 0 1 * *"
+    inputs:
+      stage:
+        description: "Which stage to run (00, 10, 20)"
+        required: true
+        default: "00"
+        type: choice
+        options:
+          - "00"
+          - "10"
+          - "20"
+  schedule:
+    # 自動は 00 だけ回す（段階はあなたが手動で進める）
+    - cron: "*/22 * * * *"
 
 concurrency:
-  group: inbox-bot-monthly
+  group: monthly-inbox-bot
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
 jobs:
-  run_monthly:
-    name: Run monthly-report pipeline (Excel)
+  run:
     runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+
+      # ---- Base paths (Dropbox) ----
+      # ここは (1) の方に合わせて Secrets を設定してください
+      BASE_DIR: ${{ secrets.MONTHLY_BASE_DIR }} # 例: /Apps/monthly-inbox-bot (1)
+
+      # ---- Stage folders ----
+      STAGE00_IN:   ${{ secrets.STAGE00_IN }}
+      STAGE00_DONE: ${{ secrets.STAGE00_DONE }}
+      STAGE00_OUT:  ${{ secrets.STAGE00_OUT }}
+
+      STAGE10_IN:   ${{ secrets.STAGE10_IN }}
+      STAGE10_DONE: ${{ secrets.STAGE10_DONE }}
+      STAGE10_OUT:  ${{ secrets.STAGE10_OUT }}
+
+      STAGE20_IN:   ${{ secrets.STAGE20_IN }}
+      STAGE20_DONE: ${{ secrets.STAGE20_DONE }}
+      STAGE20_OUT:  ${{ secrets.STAGE20_OUT }}
+
+      LOGS_DIR: ${{ secrets.LOGS_DIR }}         # 例: /Apps/monthly-inbox-bot (1)/logs
+      STATE_PATH: ${{ secrets.STATE_PATH }}     # 例: /Apps/monthly-inbox-bot (1)/state.json
+
+      # ---- runtime knobs ----
+      OPENAI_MODEL: gpt-5-mini
+      DEPTH: medium
+      OPENAI_TIMEOUT: 120
+      OPENAI_MAX_RETRIES: 2
+      OPENAI_MAX_OUTPUT_TOKENS: 5000
+      MAX_FILES_PER_RUN: 200
+      MAX_INPUT_CHARS: 80000
+      PYTHONUNBUFFERED: 1
+
+      # stage selection:
+      MONTHLY_STAGE: ${{ github.event_name == 'schedule' && '00' || inputs.stage }}
 
     steps:
       - name: Checkout
@@ -27,63 +71,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
+        shell: bash
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---- secrets sanity check (NO SECRET LEAK) ----
-      - name: Sanity check Dropbox paths (no secret leak)
-        env:
-          MONTHLY_INBOX_PATH: ${{ secrets.MONTHLY_INBOX_PATH }}
-          MONTHLY_PREP_DIR: ${{ secrets.MONTHLY_PREP_DIR }}
-          MONTHLY_OVERVIEW_DIR: ${{ secrets.MONTHLY_OVERVIEW_DIR }}
-        run: |
-          python - <<'PY'
-          import os, hashlib
-          keys = ["MONTHLY_INBOX_PATH","MONTHLY_PREP_DIR","MONTHLY_OVERVIEW_DIR"]
-          for k in keys:
-              v = os.environ.get(k, "")
-              h = hashlib.sha256(v.encode("utf-8")).hexdigest()[:12] if v else "EMPTY"
-              ok = v.startswith("/Apps/monthly-inbox-bot/")
-              print(f"{k}: len={len(v)} sha256_12={h} startswith_/Apps/monthly-inbox-bot={ok}")
-          PY
-
-      - name: Run monthly-report pipeline
-        env:
-          # Required
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
-          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
-          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-
-          MONTHLY_INBOX_PATH: ${{ secrets.MONTHLY_INBOX_PATH }}
-          MONTHLY_OUTBOX_DIR: ${{ secrets.MONTHLY_OUTBOX_DIR }}
-          MONTHLY_OVERVIEW_DIR: ${{ secrets.MONTHLY_OVERVIEW_DIR }}
-          MONTHLY_PREP_DIR: ${{ secrets.MONTHLY_PREP_DIR }}
-
-          # Optional (future use; safe to keep set)
-          STATE_PATH: ${{ secrets.STATE_PATH }}
-
-          # Pipeline behavior
-          MONTHLY_MODE: multistage
-          OPENAI_MODEL: gpt-5-mini
-          DEPTH: medium
-          OPENAI_TIMEOUT: "120"
-          OPENAI_MAX_RETRIES: "2"
-          OPENAI_MAX_OUTPUT_TOKENS: "5000"
-          MAX_FILES_PER_RUN: "200"
-          MAX_INPUT_CHARS: "80000"
-
-          # Logging
-          PYTHONUNBUFFERED: "1"
-
+      - name: Run pipeline (debug wrapper)
+        shell: bash
         run: |
           set -euxo pipefail
           python -V
-
-          # ---- debug wrapper: force error visibility ----
           python - <<'PY'
           import runpy, sys, traceback
           try:
