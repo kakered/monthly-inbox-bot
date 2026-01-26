@@ -1,181 +1,106 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-import json
 import os
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import dropbox
+from dropbox.exceptions import ApiError
 from dropbox.files import FileMetadata, FolderMetadata
+
+DbxMeta = Union[FileMetadata, FolderMetadata]
+
+
+def _norm_path(p: str) -> str:
+    """
+    Dropbox API (App folder scope):
+      - root is "" (empty string)
+      - "/" should be treated as root
+    """
+    p = (p or "").strip()
+    if p == "/" or p == "":
+        return ""
+    if not p.startswith("/"):
+        p = "/" + p
+    if len(p) > 1 and p.endswith("/"):
+        p = p[:-1]
+    return p
 
 
 @dataclass
-class DropboxItem:
-    """
-    Dropbox SDK の metadata を「dictっぽく」扱える薄いラッパー。
-    既存コードが item.get("name") のように触っても落ちないようにする。
-    """
-    raw: Any
-
-    def to_dict(self) -> Dict[str, Any]:
-        if hasattr(self.raw, "to_dict"):
-            return self.raw.to_dict()
-        return {"_raw": repr(self.raw)}
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.to_dict().get(key, default)
-
-    def __getitem__(self, key: str) -> Any:
-        return self.to_dict()[key]
-
-    @property
-    def name(self) -> Optional[str]:
-        return self.get("name")
-
-    @property
-    def path_lower(self) -> Optional[str]:
-        return self.get("path_lower")
-
-    @property
-    def path_display(self) -> Optional[str]:
-        return self.get("path_display")
-
-    @property
-    def is_folder(self) -> bool:
-        return isinstance(self.raw, FolderMetadata) or self.get(".tag") == "folder"
-
-    @property
-    def is_file(self) -> bool:
-        return isinstance(self.raw, FileMetadata) or self.get(".tag") == "file"
-
-
 class DropboxIO:
-    def __init__(
-        self,
-        refresh_token: str,
-        app_key: str,
-        app_secret: str,
-        timeout: int = 120,
-    ) -> None:
-        self.dbx = dropbox.Dropbox(
-            oauth2_refresh_token=refresh_token,
-            app_key=app_key,
-            app_secret=app_secret,
-            timeout=timeout,
-        )
+    dbx: dropbox.Dropbox
 
     @classmethod
     def from_env(cls) -> "DropboxIO":
-        """
-        既存コード互換: DropboxIO.from_env() を提供する。
-        """
-        refresh_token = os.environ["DROPBOX_REFRESH_TOKEN"]
-        app_key = os.environ["DROPBOX_APP_KEY"]
-        app_secret = os.environ["DROPBOX_APP_SECRET"]
-        timeout = int(os.getenv("DROPBOX_TIMEOUT", "120"))
-        return cls(
-            refresh_token=refresh_token,
-            app_key=app_key,
-            app_secret=app_secret,
-            timeout=timeout,
-        )
+        app_key = os.environ.get("DROPBOX_APP_KEY", "").strip()
+        app_secret = os.environ.get("DROPBOX_APP_SECRET", "").strip()
+        refresh_token = os.environ.get("DROPBOX_REFRESH_TOKEN", "").strip()
 
-    # -------- path helpers --------
-    @staticmethod
-    def _norm_path(path: str) -> str:
-        """
-        Dropbox SDK は path を `""` または `"/xxx"` 形式で受ける。
-        余計な空白・引用符・末尾スラッシュ等を正規化。
-        """
-        if path is None:
-            return ""
-        p = str(path).strip()
-
-        # ありがちな事故対策（Secrets のプレースホルダ）
-        if p in {"***", "<***>"}:
-            return p  # 上位で検出して明示エラー
-
-        # 引用符除去
-        if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
-            p = p[1:-1].strip()
-
-        # Dropbox root は "" が正
-        if p == "/":
-            return ""
-
-        # 先頭は "/" に寄せる（空はOK）
-        if p != "" and not p.startswith("/"):
-            p = "/" + p
-
-        # 末尾スラッシュは落とす（ただし "/" 単体は上で処理済み）
-        if len(p) > 1 and p.endswith("/"):
-            p = p[:-1]
-
-        return p
-
-    # -------- core --------
-    def list_folder(self, path: str, recursive: bool = False) -> List[DropboxItem]:
-        p = self._norm_path(path)
-        if p == "***":
+        if not app_key or not app_secret or not refresh_token:
             raise RuntimeError(
-                "Invalid Dropbox path: got '***'. "
-                "GitHub Secrets (MONTHLY_INBOX_PATH etc.) are likely still placeholders."
+                "Missing Dropbox env vars. Need DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN"
             )
 
-        res = self.dbx.files_list_folder(p, recursive=recursive)
-        out: List[DropboxItem] = [DropboxItem(e) for e in res.entries]
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=refresh_token,
+            app_key=app_key,
+            app_secret=app_secret,
+        )
+        return cls(dbx=dbx)
 
+    def list_folder(self, path: str, recursive: bool = False) -> List[DbxMeta]:
+        p = _norm_path(path)
+        res = self.dbx.files_list_folder(p, recursive=recursive)
+        entries: List[DbxMeta] = list(res.entries)
         while res.has_more:
             res = self.dbx.files_list_folder_continue(res.cursor)
-            out.extend(DropboxItem(e) for e in res.entries)
-
-        return out
-
-    def folder_exists(self, path: str) -> bool:
-        p = self._norm_path(path)
-        try:
-            md = self.dbx.files_get_metadata(p)
-            return isinstance(md, FolderMetadata)
-        except Exception:
-            return False
+            entries.extend(res.entries)
+        return entries
 
     def ensure_folder(self, path: str) -> None:
-        p = self._norm_path(path)
-        if p in {"", "/"}:
+        p = _norm_path(path)
+        if p == "":
             return
-        if self.folder_exists(p):
-            return
-        self.dbx.files_create_folder_v2(p)
+        try:
+            self.dbx.files_create_folder_v2(p)
+        except ApiError as e:
+            # already exists / conflict -> ignore
+            if "conflict" in str(e).lower():
+                return
+            raise
 
-    def download(self, path: str) -> bytes:
-        p = self._norm_path(path)
+    def download_to_bytes(self, path: str) -> bytes:
+        p = _norm_path(path)
         _md, resp = self.dbx.files_download(p)
         return resp.content
 
-    def upload(self, path: str, content: bytes, overwrite: bool = True) -> None:
-        p = self._norm_path(path)
-        mode = dropbox.files.WriteMode.overwrite if overwrite else dropbox.files.WriteMode.add
-        self.dbx.files_upload(content, p, mode=mode, mute=True)
+    def upload_bytes(self, path: str, data: bytes, mode_overwrite: bool = True) -> None:
+        p = _norm_path(path)
+        mode = dropbox.files.WriteMode.overwrite if mode_overwrite else dropbox.files.WriteMode.add
+        self.dbx.files_upload(data, p, mode=mode, mute=True)
 
     def move(self, src: str, dst: str, overwrite: bool = True) -> None:
-        s = self._norm_path(src)
-        d = self._norm_path(dst)
+        s = _norm_path(src)
+        d = _norm_path(dst)
+        # autorename=False に近い挙動を overwrite で制御したいがSDKのmoveは上書き指定がないため、
+        # overwrite=Trueなら同名でもautorename=Falseで衝突→例外になり得る。
+        # ここは「基本はユニーク名でdstを作る」設計で回避する。
         self.dbx.files_move_v2(s, d, autorename=not overwrite)
 
-    def delete(self, path: str) -> None:
-        p = self._norm_path(path)
-        self.dbx.files_delete_v2(p)
+    def exists(self, path: str) -> bool:
+        p = _norm_path(path)
+        try:
+            self.dbx.files_get_metadata(p)
+            return True
+        except ApiError:
+            return False
 
-    # -------- convenience --------
-    def read_text(self, path: str, encoding: str = "utf-8") -> str:
-        return self.download(path).decode(encoding, errors="replace")
-
-    def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
-        self.upload(path, text.encode(encoding))
-
-    def read_json(self, path: str) -> Any:
-        return json.loads(self.read_text(path))
-
-    def write_json(self, path: str, obj: Any, indent: int = 2) -> None:
-        self.write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent) + "\n")
+    def read_json_bytes_or_none(self, path: str) -> Optional[bytes]:
+        """
+        ★ 今回のエラー原因のメソッド：monthly_pipeline_MULTISTAGE が呼びます
+        """
+        if not self.exists(path):
+            return None
+        return self.download_to_bytes(path)
