@@ -1,19 +1,9 @@
-name: Run monthly-report pipeline (Excel)
+name: inbox-bot (monthly)
 
 on:
   workflow_dispatch:
-    inputs:
-      stage:
-        description: "Which stage to run (00, 10, 20)"
-        required: true
-        default: "00"
-        type: choice
-        options:
-          - "00"
-          - "10"
-          - "20"
   schedule:
-    # 自動は 00 だけ回す（段階はあなたが手動で進める）
+    # 例: 22分おき（必要なら調整）
     - cron: "*/22 * * * *"
 
 concurrency:
@@ -23,45 +13,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
-      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-
-      # ---- Base paths (Dropbox) ----
-      # ここは (1) の方に合わせて Secrets を設定してください
-      BASE_DIR: ${{ secrets.MONTHLY_BASE_DIR }} # 例: /Apps/monthly-inbox-bot (1)
-
-      # ---- Stage folders ----
-      STAGE00_IN:   ${{ secrets.STAGE00_IN }}
-      STAGE00_DONE: ${{ secrets.STAGE00_DONE }}
-      STAGE00_OUT:  ${{ secrets.STAGE00_OUT }}
-
-      STAGE10_IN:   ${{ secrets.STAGE10_IN }}
-      STAGE10_DONE: ${{ secrets.STAGE10_DONE }}
-      STAGE10_OUT:  ${{ secrets.STAGE10_OUT }}
-
-      STAGE20_IN:   ${{ secrets.STAGE20_IN }}
-      STAGE20_DONE: ${{ secrets.STAGE20_DONE }}
-      STAGE20_OUT:  ${{ secrets.STAGE20_OUT }}
-
-      LOGS_DIR: ${{ secrets.LOGS_DIR }}         # 例: /Apps/monthly-inbox-bot (1)/logs
-      STATE_PATH: ${{ secrets.STATE_PATH }}     # 例: /Apps/monthly-inbox-bot (1)/state.json
-
-      # ---- runtime knobs ----
-      OPENAI_MODEL: gpt-5-mini
-      DEPTH: medium
-      OPENAI_TIMEOUT: 120
-      OPENAI_MAX_RETRIES: 2
-      OPENAI_MAX_OUTPUT_TOKENS: 5000
-      MAX_FILES_PER_RUN: 200
-      MAX_INPUT_CHARS: 80000
-      PYTHONUNBUFFERED: 1
-
-      # stage selection:
-      MONTHLY_STAGE: ${{ github.event_name == 'schedule' && '00' || inputs.stage }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,18 +22,119 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run pipeline (debug wrapper)
+      # 変数が "空" で渡っていないかを見える化（秘密は出さない）
+      - name: Sanity check Dropbox paths (no secret leak)
         shell: bash
+        env:
+          BASE_DIR: ${{ vars.BASE_DIR }}
+          LOGS_DIR: ${{ vars.LOGS_DIR }}
+
+          STAGE00_IN: ${{ vars.STAGE00_IN }}
+          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
+          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
+
+          STAGE10_IN: ${{ vars.STAGE10_IN }}
+          STAGE10_OUT: ${{ vars.STAGE10_OUT }}
+          STAGE10_DONE: ${{ vars.STAGE10_DONE }}
+
+          STAGE20_IN: ${{ vars.STAGE20_IN }}
+          STAGE20_OUT: ${{ vars.STAGE20_OUT }}
+          STAGE20_DONE: ${{ vars.STAGE20_DONE }}
+
+          STAGE30_IN: ${{ vars.STAGE30_IN }}
+          STAGE30_OUT: ${{ vars.STAGE30_OUT }}
+          STAGE30_DONE: ${{ vars.STAGE30_DONE }}
+
+          STAGE40_IN: ${{ vars.STAGE40_IN }}
+          STAGE40_OUT: ${{ vars.STAGE40_OUT }}
+          STAGE40_DONE: ${{ vars.STAGE40_DONE }}
+
+          MONTHLY_STAGE: ${{ vars.MONTHLY_STAGE }}
+          STATE_PATH: ${{ secrets.STATE_PATH }}
+        run: |
+          python - <<'PY'
+          import os, hashlib
+
+          keys = [
+            "BASE_DIR","LOGS_DIR",
+            "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
+            "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
+            "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
+            "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
+            "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
+            "MONTHLY_STAGE","STATE_PATH",
+          ]
+
+          def short(v: str) -> str:
+            if v is None:
+              return "None"
+            s = str(v)
+            h = hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+            return f"len={len(s)} sha256_12={h} startswith_/={s.startswith('/') if s else False}"
+
+          for k in keys:
+            v = os.getenv(k)
+            print(f"{k}: {short(v)}")
+          PY
+
+      - name: Run pipeline (debug wrapper)
+        shell: bash --noprofile --norc -e -o pipefail {0}
+        env:
+          # --- Secrets ---
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          STATE_PATH: ${{ secrets.STATE_PATH }}
+
+          # --- Repository variables（ここが今回の本体：vars → env へ明示的に渡す）---
+          BASE_DIR: ${{ vars.BASE_DIR }}
+          LOGS_DIR: ${{ vars.LOGS_DIR }}
+
+          STAGE00_IN: ${{ vars.STAGE00_IN }}
+          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
+          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
+
+          STAGE10_IN: ${{ vars.STAGE10_IN }}
+          STAGE10_OUT: ${{ vars.STAGE10_OUT }}
+          STAGE10_DONE: ${{ vars.STAGE10_DONE }}
+
+          STAGE20_IN: ${{ vars.STAGE20_IN }}
+          STAGE20_OUT: ${{ vars.STAGE20_OUT }}
+          STAGE20_DONE: ${{ vars.STAGE20_DONE }}
+
+          STAGE30_IN: ${{ vars.STAGE30_IN }}
+          STAGE30_OUT: ${{ vars.STAGE30_OUT }}
+          STAGE30_DONE: ${{ vars.STAGE30_DONE }}
+
+          STAGE40_IN: ${{ vars.STAGE40_IN }}
+          STAGE40_OUT: ${{ vars.STAGE40_OUT }}
+          STAGE40_DONE: ${{ vars.STAGE40_DONE }}
+
+          # スイッチ（半自動）：Repository variables に MONTHLY_STAGE を入れて切替
+          # 例: 00 / 10 / 20 / 30 / 40
+          MONTHLY_STAGE: ${{ vars.MONTHLY_STAGE || '00' }}
+
+          # --- Optional tuning ---
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5-mini' }}
+          DEPTH: ${{ vars.DEPTH || 'medium' }}
+          OPENAI_TIMEOUT: ${{ vars.OPENAI_TIMEOUT || '120' }}
+          OPENAI_MAX_RETRIES: ${{ vars.OPENAI_MAX_RETRIES || '2' }}
+          OPENAI_MAX_OUTPUT_TOKENS: ${{ vars.OPENAI_MAX_OUTPUT_TOKENS || '5000' }}
+          MAX_FILES_PER_RUN: ${{ vars.MAX_FILES_PER_RUN || '200' }}
+          MAX_INPUT_CHARS: ${{ vars.MAX_INPUT_CHARS || '80000' }}
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euxo pipefail
           python -V
+
           python - <<'PY'
           import runpy, sys, traceback
           try:
