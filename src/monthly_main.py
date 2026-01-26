@@ -2,54 +2,75 @@
 from __future__ import annotations
 
 import os
+import sys
+import traceback
+
+import dropbox
+
+from .dropbox_io import DropboxIO
+from .monthly_spec import MonthlyCfg
+from .monthly_pipeline_MULTISTAGE import run_multistage
+
+
+def _env(name: str, default: str = "") -> str:
+    v = os.environ.get(name, default)
+    return v.strip() if isinstance(v, str) else default
+
+
+def _build_cfg() -> MonthlyCfg:
+    # STAGE00/10/20/30 は GitHub Actions Variables で設定している前提
+    inbox_path = _env("STAGE00_IN", "/00_inbox_raw/IN")
+    prep_dir = _env("STAGE10_IN", "/10_preformat_py/IN")
+    overview_dir = _env("STAGE20_IN", "/20_overview_api/IN")
+    outbox_dir = _env("STAGE30_IN", "/30_personalize_py/IN")
+
+    state_path = _env("STATE_PATH", "/_system/state.json")
+    logs_dir = _env("LOGS_DIR", "/_system/logs")
+
+    return MonthlyCfg(
+        inbox_path=inbox_path,
+        prep_dir=prep_dir,
+        overview_dir=overview_dir,
+        outbox_dir=outbox_dir,
+        state_path=state_path,
+        logs_dir=logs_dir,
+        mode=_env("MONTHLY_MODE", "multistage"),
+    )
+
+
+def _build_dbx() -> DropboxIO:
+    refresh = _env("DROPBOX_REFRESH_TOKEN")
+    app_key = _env("DROPBOX_APP_KEY")
+    app_secret = _env("DROPBOX_APP_SECRET")
+
+    if not refresh or not app_key or not app_secret:
+        raise RuntimeError(
+            "Missing Dropbox credentials. Require DROPBOX_REFRESH_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET."
+        )
+
+    dbx = dropbox.Dropbox(
+        oauth2_refresh_token=refresh,
+        app_key=app_key,
+        app_secret=app_secret,
+    )
+    return DropboxIO(dbx)
 
 
 def main() -> int:
-    mode = (os.getenv("MONTHLY_MODE") or "multistage").strip().lower()
+    cfg = _build_cfg()
+    dbx = _build_dbx()
 
-    if mode == "multistage":
-        from .monthly_pipeline_MULTISTAGE import run_multistage
-
-        run_multistage()
-        return 0
-
-    # single (legacy) - keep minimal behavior if you ever use it
-    from .dropbox_io import DropboxIO
-    from .excel_exporter import process_monthly_workbook
-
-    inbox_path = os.getenv("MONTHLY_INBOX_PATH", "/00_inbox_raw/IN")
-    outbox_dir = os.getenv("MONTHLY_OUTBOX_DIR", "/30_personalize_py/OUT")
-
-    dbx = DropboxIO.from_env()
-    dbx.ensure_folder(outbox_dir)
-
-    items = dbx.list_folder(inbox_path)
-    target = None
-    for it in items:
-        name = getattr(it, "name", None)
-        if isinstance(name, str) and name.lower().endswith((".xlsx", ".xlsm", ".xls")):
-            target = it
-            break
-
-    if not target:
-        print(f"[MONTHLY] No Excel found under: {inbox_path}")
-        return 0
-
-    path = getattr(target, "path_display", None) or getattr(target, "path_lower", None)
-    if not isinstance(path, str):
-        print("[MONTHLY] Could not resolve target path")
-        return 1
-
-    data = dbx.download_to_bytes(path)
-    overview_bytes, per_person_bytes = process_monthly_workbook(data, password=None)
-
-    base = os.path.splitext(os.path.basename(path))[0]
-    dbx.upload_bytes(f"{outbox_dir}/{base}__overview.xlsx", overview_bytes)
-    dbx.upload_bytes(f"{outbox_dir}/{base}__per_person.xlsx", per_person_bytes)
-
-    print(f"[MONTHLY] wrote outputs to: {outbox_dir}")
+    # 実行（マルチステージ）
+    run_multistage(dbx, cfg)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        print("[MONTHLY] Unhandled exception:", file=sys.stderr)
+        traceback.print_exc()
+        raise SystemExit(1)
