@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, List, Optional
 import json
 import os
 
 import dropbox
-from dropbox.files import FileMetadata, FolderMetadata, DeletedMetadata
+from dropbox.files import FileMetadata, FolderMetadata
 
 
 @dataclass
@@ -21,7 +21,6 @@ class DropboxItem:
     def to_dict(self) -> Dict[str, Any]:
         if hasattr(self.raw, "to_dict"):
             return self.raw.to_dict()
-        # 念のため
         return {"_raw": repr(self.raw)}
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -66,6 +65,22 @@ class DropboxIO:
             timeout=timeout,
         )
 
+    @classmethod
+    def from_env(cls) -> "DropboxIO":
+        """
+        既存コード互換: DropboxIO.from_env() を提供する。
+        """
+        refresh_token = os.environ["DROPBOX_REFRESH_TOKEN"]
+        app_key = os.environ["DROPBOX_APP_KEY"]
+        app_secret = os.environ["DROPBOX_APP_SECRET"]
+        timeout = int(os.getenv("DROPBOX_TIMEOUT", "120"))
+        return cls(
+            refresh_token=refresh_token,
+            app_key=app_key,
+            app_secret=app_secret,
+            timeout=timeout,
+        )
+
     # -------- path helpers --------
     @staticmethod
     def _norm_path(path: str) -> str:
@@ -77,9 +92,9 @@ class DropboxIO:
             return ""
         p = str(path).strip()
 
-        # ありがちな事故対策
-        if p in {"***", "<***>", '""', "''"}:
-            return p  # 上位で検出してエラーにしたいのでそのまま返す
+        # ありがちな事故対策（Secrets のプレースホルダ）
+        if p in {"***", "<***>"}:
+            return p  # 上位で検出して明示エラー
 
         # 引用符除去
         if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
@@ -135,7 +150,7 @@ class DropboxIO:
 
     def download(self, path: str) -> bytes:
         p = self._norm_path(path)
-        md, resp = self.dbx.files_download(p)
+        _md, resp = self.dbx.files_download(p)
         return resp.content
 
     def upload(self, path: str, content: bytes, overwrite: bool = True) -> None:
@@ -164,19 +179,3 @@ class DropboxIO:
 
     def write_json(self, path: str, obj: Any, indent: int = 2) -> None:
         self.write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent) + "\n")
-
-
-def make_dropbox_io_from_env() -> DropboxIO:
-    """
-    既存コードが環境変数から DropboxIO を作る場合のために用意。
-    """
-    refresh_token = os.environ["DROPBOX_REFRESH_TOKEN"]
-    app_key = os.environ["DROPBOX_APP_KEY"]
-    app_secret = os.environ["DROPBOX_APP_SECRET"]
-    timeout = int(os.getenv("DROPBOX_TIMEOUT", "120"))
-    return DropboxIO(
-        refresh_token=refresh_token,
-        app_key=app_key,
-        app_secret=app_secret,
-        timeout=timeout,
-    )
