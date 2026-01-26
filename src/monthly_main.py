@@ -2,14 +2,14 @@
 """
 src/monthly_main.py
 
-目的:
-- Dropbox APIが「実際に見えている」パス空間をログに出して、UIで見ている場所とのズレを可視化する。
-- 既存のパイプライン実行（monthly_pipeline_MULTISTAGE/run_multistage 等）が存在するならそれを優先して呼ぶ。
-- 存在しない場合でも、最低限「IN 配下に Excel が見えているか」をチェックして、見えていなければ安全に終了する。
+やること（重要）:
+1) monthly_pipeline_MULTISTAGE.py が参照する cfg.inbox_path / cfg.prep_dir / cfg.overview_dir / cfg.outbox_dir を必ず持たせる
+2) MONTHLY_* が空でも、STAGE00_IN / STAGE10_IN... などから復元して動くようにする
+3) Dropbox が見えているパス空間のデバッグ出力を残す（secretsは出さない）
 
-注意:
-- secrets は出さない（OPENAI_API_KEY 等は表示しない）。
-- Dropbox のパス/ファイル名はデバッグのために出す（必要なら後でマスク可能）。
+ポイント:
+- これで "No Excel found under: /00_inbox_raw/IN" が出る場合、
+  「Dropbox API から見えていない」か「ファイルがまだ同期中」かが切り分けできる。
 """
 
 from __future__ import annotations
@@ -18,40 +18,20 @@ import os
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, List
+from typing import Any, List
 
 from .dropbox_io import DropboxIO
 
 
 # -------------------------
-# Config (env)
+# env utils
 # -------------------------
-
-@dataclass
-class MonthlyCfg:
-    monthly_stage: str = "00"  # "00" / "10" / "20" / "30" / "40" etc.
-    max_files_per_run: int = 200
-
-    # stage-map後に bash がセットしてくる想定の「統一」環境変数
-    monthly_inbox_path: str = ""
-    monthly_prep_dir: str = ""
-    monthly_overview_dir: str = ""
-    monthly_outbox_dir: str = ""
-
-    logs_dir: str = ""
-    state_path: str = ""
-
-    # 互換のため残す（既存コードが使ってる可能性）
-    monthly_mode: str = "multistage"
-
-    def validate(self) -> None:
-        # 空でもクラッシュしない。後でデバッグ出力で分かるようにする。
-        pass
-
 
 def _getenv_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    return default if v is None else str(v)
+    if v is None:
+        return default
+    return str(v)
 
 
 def _getenv_int(name: str, default: int) -> int:
@@ -64,28 +44,115 @@ def _getenv_int(name: str, default: int) -> int:
         return default
 
 
+def _norm_path(p: str) -> str:
+    # Dropbox API のパスは先頭 "/" が基本
+    if not p:
+        return ""
+    p = p.strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    # 末尾スラッシュは基本落とす（IN/DONE/OUT 等は呼び元でつける）
+    if len(p) > 1 and p.endswith("/"):
+        p = p[:-1]
+    return p
+
+
+def _stage_key(stage: str) -> str:
+    # "0" -> "00" など
+    s = str(stage).strip()
+    if s.isdigit():
+        return s.zfill(2)
+    return s
+
+
+def _pick_stage_paths(stage: str) -> tuple[str, str, str, str]:
+    """
+    MONTHLY_* が空だった時の救済:
+    - STAGE00_IN / STAGE00_OUT / STAGE00_DONE ... のような repo variables を使って復元する
+    """
+    st = _stage_key(stage)
+
+    # Stage00 の「入力」は STAGE00_IN を期待
+    inbox = _getenv_str(f"STAGE{st}_IN", "")
+
+    # 次段の IN は「その段の IN」だが、pipelineの用語としては
+    # prep_dir/overview_dir/outbox_dir は「各段の IN」を指す運用にしているので
+    # ここでは "ステージ全体のルート" ではなく "IN" を優先して使う。
+    # ただし変数側が "/10_preformat_py/IN" のように IN 込みで入っている前提。
+    prep = _getenv_str("STAGE10_IN", "")
+    overview = _getenv_str("STAGE20_IN", "")
+    outbox = _getenv_str("STAGE30_IN", "")
+
+    return inbox, prep, overview, outbox
+
+
+# -------------------------
+# Config
+# -------------------------
+
+@dataclass
+class MonthlyCfg:
+    # pipeline側が期待している名前（重要）
+    inbox_path: str = ""
+    prep_dir: str = ""
+    overview_dir: str = ""
+    outbox_dir: str = ""
+
+    logs_dir: str = ""
+    state_path: str = ""
+
+    monthly_stage: str = "00"
+    max_files_per_run: int = 200
+
+    # 互換（残しておく）
+    monthly_mode: str = "multistage"
+
+    def __post_init__(self) -> None:
+        # normalize
+        self.inbox_path = _norm_path(self.inbox_path)
+        self.prep_dir = _norm_path(self.prep_dir)
+        self.overview_dir = _norm_path(self.overview_dir)
+        self.outbox_dir = _norm_path(self.outbox_dir)
+        self.logs_dir = _norm_path(self.logs_dir)
+        self.state_path = _norm_path(self.state_path)
+
+
 def load_cfg_from_env() -> MonthlyCfg:
+    stage = _getenv_str("MONTHLY_STAGE", "00")
+
+    # まず MONTHLY_* を優先
+    inbox = _getenv_str("MONTHLY_INBOX_PATH", "")
+    prep = _getenv_str("MONTHLY_PREP_DIR", "")
+    overview = _getenv_str("MONTHLY_OVERVIEW_DIR", "")
+    outbox = _getenv_str("MONTHLY_OUTBOX_DIR", "")
+
+    # 空なら STAGE??_IN 等から復元（今回のログはここが必要）
+    if not any([inbox, prep, overview, outbox]):
+        inbox2, prep2, overview2, outbox2 = _pick_stage_paths(stage)
+        inbox = inbox or inbox2
+        prep = prep or prep2
+        overview = overview or overview2
+        outbox = outbox or outbox2
+
     cfg = MonthlyCfg(
-        monthly_stage=_getenv_str("MONTHLY_STAGE", _getenv_str("MONTHLY_STAGE", "00")),
+        inbox_path=inbox,
+        prep_dir=prep,
+        overview_dir=overview,
+        outbox_dir=outbox,
+        logs_dir=_getenv_str("LOGS_DIR", "/_system/logs"),
+        state_path=_getenv_str("STATE_PATH", "/_system/state.json"),
+        monthly_stage=stage,
         max_files_per_run=_getenv_int("MAX_FILES_PER_RUN", 200),
-        monthly_inbox_path=_getenv_str("MONTHLY_INBOX_PATH", ""),
-        monthly_prep_dir=_getenv_str("MONTHLY_PREP_DIR", ""),
-        monthly_overview_dir=_getenv_str("MONTHLY_OVERVIEW_DIR", ""),
-        monthly_outbox_dir=_getenv_str("MONTHLY_OUTBOX_DIR", ""),
-        logs_dir=_getenv_str("LOGS_DIR", ""),
-        state_path=_getenv_str("STATE_PATH", ""),
         monthly_mode=_getenv_str("MONTHLY_MODE", "multistage"),
     )
-    cfg.validate()
     return cfg
 
 
 # -------------------------
-# Debug helpers (Dropbox visibility)
+# Debug helpers
 # -------------------------
 
 def _safe_print_kv(title: str, value: str) -> None:
-    # secrets をここに渡さない前提。パスだけ。
     print(f"[MONTHLY] {title}={value}", flush=True)
 
 
@@ -111,79 +178,51 @@ def _list_folder_safe(dbx: DropboxIO, path: str, limit: int = 50) -> List[Any]:
 
 
 def _looks_like_excel(name: str) -> bool:
-    n = name.lower()
+    n = (name or "").lower()
     return n.endswith(".xlsx") or n.endswith(".xlsm") or n.endswith(".xls")
 
 
-def _find_excels_in_folder(dbx: DropboxIO, folder: str, limit_scan: int = 500) -> List[Any]:
-    items = _list_folder_safe(dbx, folder, limit=min(200, limit_scan))
-    excels = []
+def _find_excels_in_folder(dbx: DropboxIO, folder: str, limit_list: int = 200) -> List[Any]:
+    items = _list_folder_safe(dbx, folder, limit=limit_list)
+    out: List[Any] = []
     for it in items:
         name = getattr(it, "name", "") or ""
         if _looks_like_excel(name):
-            excels.append(it)
-    return excels
+            out.append(it)
+    return out
 
 
 def debug_dropbox_visibility(dbx: DropboxIO, cfg: MonthlyCfg) -> None:
-    """
-    ここが「ズレ」特定のための主役。
-    - ルート("", "/") や /Apps 周りを試し、どの世界が見えているかをログに残す。
-    - 実際に処理対象の inbox_path も必ず list する。
-    """
     print("\n[MONTHLY] ===== Dropbox visibility debug (START) =====", flush=True)
 
-    # 重要: いま Python が見ている env を明示（値そのものはパスだけなのでOK）
     _safe_print_kv("MONTHLY_STAGE", cfg.monthly_stage)
-    _safe_print_kv("MONTHLY_INBOX_PATH", cfg.monthly_inbox_path)
-    _safe_print_kv("MONTHLY_PREP_DIR", cfg.monthly_prep_dir)
-    _safe_print_kv("MONTHLY_OVERVIEW_DIR", cfg.monthly_overview_dir)
-    _safe_print_kv("MONTHLY_OUTBOX_DIR", cfg.monthly_outbox_dir)
+    _safe_print_kv("inbox_path", cfg.inbox_path)
+    _safe_print_kv("prep_dir", cfg.prep_dir)
+    _safe_print_kv("overview_dir", cfg.overview_dir)
+    _safe_print_kv("outbox_dir", cfg.outbox_dir)
     _safe_print_kv("LOGS_DIR", cfg.logs_dir)
-    _safe_print_kv("STATE_PATH", cfg.state_path)
+    _safe_print_kv("STATE_PATH", "***" if cfg.state_path else "")
     _safe_print_kv("MONTHLY_MODE", cfg.monthly_mode)
 
-    # いくつかの定番候補を順に試す（Appフォルダ型だと見えないものもある）
-    candidates: List[str] = []
-    candidates += ["", "/"]
-    candidates += ["/Apps", "/Apps/monthly-inbox-bot"]
+    # どの世界が見えているか
+    for c in ["", "/", "/Apps", "/Apps/monthly-inbox-bot", cfg.logs_dir]:
+        if c:
+            _list_folder_safe(dbx, c, limit=50)
 
-    # あなたの運用フォルダ候補（stage-map後の値）
-    if cfg.monthly_inbox_path:
-        candidates += [cfg.monthly_inbox_path]
-        # INフォルダも念のため
-        if not cfg.monthly_inbox_path.rstrip("/").endswith("/IN"):
-            candidates += [cfg.monthly_inbox_path.rstrip("/") + "/IN"]
-
-    # stage dirs も一応
-    for p in [cfg.monthly_prep_dir, cfg.monthly_overview_dir, cfg.monthly_outbox_dir, cfg.logs_dir]:
-        if p:
-            candidates.append(p)
-
-    # 重複除去（順序維持）
-    seen = set()
-    uniq_candidates: List[str] = []
-    for c in candidates:
-        if c in seen:
-            continue
-        seen.add(c)
-        uniq_candidates.append(c)
-
-    for c in uniq_candidates:
-        _list_folder_safe(dbx, c, limit=50)
-
-    # inbox_path 直下で Excel を探す（見つからない問題の核心）
-    inbox = cfg.monthly_inbox_path or ""
-    if inbox:
-        excels = _find_excels_in_folder(dbx, inbox)
+    # ここが最重要：入力フォルダとINの中身
+    if cfg.inbox_path:
+        _list_folder_safe(dbx, cfg.inbox_path, limit=100)
+        excels = _find_excels_in_folder(dbx, cfg.inbox_path, limit_list=200)
         if excels:
-            print(f"\n[MONTHLY][DBG] Excel found under {inbox!r}: {len(excels)}", flush=True)
+            print(f"\n[MONTHLY][DBG] Excel found under {cfg.inbox_path!r}: {len(excels)}", flush=True)
             for it in excels[:30]:
                 n = getattr(it, "name", None)
                 p = getattr(it, "path_display", None) or getattr(it, "path_lower", None)
                 print(f"[MONTHLY][DBG]   * {n} | {p}", flush=True)
         else:
-            print(f"\n[MONTHLY][DBG] No Excel found directly under: {inbox}", flush=True)
+            print(f"\n[MONTHLY][DBG] No Excel found directly under: {cfg.inbox_path}", flush=True)
+    else:
+        print("\n[MONTHLY][DBG] inbox_path is empty (env not wired).", flush=True)
 
     print("[MONTHLY] ===== Dropbox visibility debug (END) =====\n", flush=True)
 
@@ -194,88 +233,48 @@ def debug_dropbox_visibility(dbx: DropboxIO, cfg: MonthlyCfg) -> None:
 
 def try_run_existing_pipeline(dbx: DropboxIO, cfg: MonthlyCfg) -> bool:
     """
-    既存の pipeline 実装があるなら呼ぶ。
-    失敗した場合は例外を握りつぶさず、上位で落として良い（原因がログに出るため）。
-    戻り値:
-      True  = pipeline 実行に移行した（=この関数内で呼んだ）
-      False = pipeline モジュールが見つからない等で呼べなかった
+    monthly_pipeline_MULTISTAGE があればそれを呼ぶ。
+    （cfg に inbox_path 等が揃ったので、ここで落ちなくなるはず）
     """
-    # 1) monthly_pipeline_MULTISTAGE.py があるケース
     try:
         from .monthly_pipeline_MULTISTAGE import run_multistage  # type: ignore
-        # 既存関数の引数形が (dbx, cfg) か (dbx, state, cfg) か不明なので吸収
-        try:
-            run_multistage(dbx, cfg)  # type: ignore
-        except TypeError:
-            # state を Dropbox 上の JSON として扱っている可能性
-            state = {}
-            try:
-                if cfg.state_path:
-                    state = dbx.read_json(cfg.state_path) or {}
-            except Exception:
-                state = {}
-            run_multistage(dbx, state, cfg)  # type: ignore
-        return True
     except ModuleNotFoundError:
-        pass
+        return False
+
+    # state の読み込み（失敗しても空で続行）
+    state = {}
+    try:
+        if cfg.state_path:
+            state = dbx.read_json(cfg.state_path) or {}
     except Exception:
-        # 実装が存在していて内部で落ちた場合は、そのまま上に投げる
-        raise
+        state = {}
 
-    # 2) もし monthly_pipeline.py / monthly_pipeline_SINGLE.py があるケース（保険）
-    for mod_name, fn_name in [
-        (".monthly_pipeline", "run"),
-        (".monthly_pipeline", "main"),
-        (".monthly_pipeline_SINGLE", "run_single"),
-        (".monthly_pipeline_SINGLE", "run"),
-    ]:
-        try:
-            mod = __import__(f"src{mod_name}", fromlist=[fn_name])
-            fn = getattr(mod, fn_name, None)
-            if fn is None:
-                continue
-            try:
-                fn(dbx, cfg)  # type: ignore
-            except TypeError:
-                state = {}
-                try:
-                    if cfg.state_path:
-                        state = dbx.read_json(cfg.state_path) or {}
-                except Exception:
-                    state = {}
-                fn(dbx, state, cfg)  # type: ignore
-            return True
-        except ModuleNotFoundError:
-            continue
-        except Exception:
-            raise
-
-    return False
+    # 関数シグネチャ差の吸収
+    try:
+        run_multistage(dbx, cfg)  # type: ignore
+    except TypeError:
+        run_multistage(dbx, state, cfg)  # type: ignore
+    return True
 
 
-def fallback_stage00_check_only(dbx: DropboxIO, cfg: MonthlyCfg) -> int:
+def fallback_check_only(dbx: DropboxIO, cfg: MonthlyCfg) -> int:
     """
-    既存 pipeline が無い/呼べない場合の最低限動作:
-    - inbox_path を見に行き、Excel が無ければ 0（成功）で終了
-    - Excel があれば「見えている」ことだけログに出して 0 で終了（まだ処理はしない）
+    pipeline が呼べない場合の最低限
     """
-    inbox = cfg.monthly_inbox_path
-    if not inbox:
-        print("[MONTHLY] inbox path is empty. (MONTHLY_INBOX_PATH not set?)", flush=True)
+    if not cfg.inbox_path:
+        print("[MONTHLY] inbox_path is empty. Check env wiring in workflow.", flush=True)
         return 0
 
-    excels = _find_excels_in_folder(dbx, inbox)
+    excels = _find_excels_in_folder(dbx, cfg.inbox_path, limit_list=200)
     if not excels:
-        print(f"[MONTHLY] No Excel found under:\n{inbox}", flush=True)
+        print(f"[MONTHLY] No Excel found under:\n{cfg.inbox_path}", flush=True)
         return 0
 
-    print(f"[MONTHLY] Excel detected under {inbox}: {len(excels)} file(s).", flush=True)
+    print(f"[MONTHLY] Excel detected under {cfg.inbox_path}: {len(excels)} file(s).", flush=True)
     for it in excels[:20]:
         n = getattr(it, "name", None)
         p = getattr(it, "path_display", None) or getattr(it, "path_lower", None)
         print(f"[MONTHLY]   - {n} | {p}", flush=True)
-
-    print("[MONTHLY] (fallback) Not processing in this mode; pipeline module not found.", flush=True)
     return 0
 
 
@@ -287,16 +286,13 @@ def main() -> int:
     cfg = load_cfg_from_env()
     dbx = DropboxIO.from_env()
 
-    # まず「見えている世界」を出す（ここが今回の目的）
     debug_dropbox_visibility(dbx, cfg)
 
-    # 既存 pipeline があればそれを優先して実行
     ran = try_run_existing_pipeline(dbx, cfg)
     if ran:
         return 0
 
-    # 無ければ最低限のチェックだけ
-    return fallback_stage00_check_only(dbx, cfg)
+    return fallback_check_only(dbx, cfg)
 
 
 if __name__ == "__main__":
