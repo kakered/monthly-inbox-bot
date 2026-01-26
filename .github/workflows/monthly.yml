@@ -3,8 +3,8 @@ name: inbox-bot (monthly)
 on:
   workflow_dispatch:
     inputs:
-      MONTHLY_STAGE:
-        description: "Run stage (00/10/20/30/40). Uses repository variables STAGE**_IN/OUT/DONE."
+      monthly_stage:
+        description: "Which stage to run (00/10/20/30/40)."
         required: true
         default: "00"
         type: choice
@@ -14,14 +14,6 @@ on:
           - "20"
           - "30"
           - "40"
-  schedule:
-    # 必要なら有効化（例：毎日 02:10 JST = 17:10 UTC）
-    # - cron: "10 17 * * *"
-    - cron: "0 0 * * *"
-
-concurrency:
-  group: monthly-inbox-bot
-  cancel-in-progress: false
 
 jobs:
   run:
@@ -43,82 +35,89 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ---- Sanity check: show only lengths/hashes (no secret leak) ----
       - name: Sanity check Dropbox paths (no secret leak)
         shell: bash
         env:
-          # ---- secrets ----
+          # Repo variables (plain text)
+          LOGS_DIR: ${{ vars.LOGS_DIR }}
+          STAGE00_IN: ${{ vars.STAGE00_IN }}
+          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
+          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
+          STAGE10_IN: ${{ vars.STAGE10_IN }}
+          STAGE10_OUT: ${{ vars.STAGE10_OUT }}
+          STAGE10_DONE: ${{ vars.STAGE10_DONE }}
+          STAGE20_IN: ${{ vars.STAGE20_IN }}
+          STAGE20_OUT: ${{ vars.STAGE20_OUT }}
+          STAGE20_DONE: ${{ vars.STAGE20_DONE }}
+          STAGE30_IN: ${{ vars.STAGE30_IN }}
+          STAGE30_OUT: ${{ vars.STAGE30_OUT }}
+          STAGE30_DONE: ${{ vars.STAGE30_DONE }}
+          STAGE40_IN: ${{ vars.STAGE40_IN }}
+          STAGE40_OUT: ${{ vars.STAGE40_OUT }}
+          STAGE40_DONE: ${{ vars.STAGE40_DONE }}
+          # Secrets
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           STATE_PATH: ${{ secrets.STATE_PATH }}
-
-          # ---- stage selector ----
-          MONTHLY_STAGE: ${{ inputs.MONTHLY_STAGE }}
-
-          # ---- repository variables (plain text) ----
-          LOGS_DIR: ${{ vars.LOGS_DIR }}
-
-          STAGE00_IN: ${{ vars.STAGE00_IN }}
-          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
-          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
-
-          STAGE10_IN: ${{ vars.STAGE10_IN }}
-          STAGE10_OUT: ${{ vars.STAGE10_OUT }}
-          STAGE10_DONE: ${{ vars.STAGE10_DONE }}
-
-          STAGE20_IN: ${{ vars.STAGE20_IN }}
-          STAGE20_OUT: ${{ vars.STAGE20_OUT }}
-          STAGE20_DONE: ${{ vars.STAGE20_DONE }}
-
-          STAGE30_IN: ${{ vars.STAGE30_IN }}
-          STAGE30_OUT: ${{ vars.STAGE30_OUT }}
-          STAGE30_DONE: ${{ vars.STAGE30_DONE }}
-
-          STAGE40_IN: ${{ vars.STAGE40_IN }}
-          STAGE40_OUT: ${{ vars.STAGE40_OUT }}
-          STAGE40_DONE: ${{ vars.STAGE40_DONE }}
         run: |
           set -euxo pipefail
           python - <<'PY'
           import os, hashlib
 
-          def show(name: str):
-              v = os.environ.get(name, "")
-              h = hashlib.sha256(v.encode("utf-8")).hexdigest()[:12] if v else "EMPTY"
-              print(f"{name}: len={len(v)} sha256_12={h} startswith_/={v.startswith('/') if v else False}")
+          def short_hash(s: str) -> str:
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
-          print("== stage selector ==")
-          show("MONTHLY_STAGE")
+          keys = [
+            "LOGS_DIR",
+            "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
+            "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
+            "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
+            "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
+            "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
+          ]
+          for k in keys:
+            v = os.environ.get(k, "")
+            print(f"{k}: len={len(v)} sha256_12={short_hash(v) if v else 'EMPTY'} startswith_/={v.startswith('/') if v else False}")
 
-          print("\n== repo vars (paths) ==")
-          for k in [
-              "LOGS_DIR",
-              "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
-              "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
-              "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
-              "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
-              "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
-          ]:
-              show(k)
-
-          print("\n== secrets present? (length only) ==")
+          print("== secrets present? (length only) ==")
           for k in ["OPENAI_API_KEY","DROPBOX_REFRESH_TOKEN","DROPBOX_APP_KEY","DROPBOX_APP_SECRET","STATE_PATH"]:
-              v = os.environ.get(k, "")
-              print(f"{k}: len={len(v)}")
+            v = os.environ.get(k, "")
+            print(f"{k}: len={len(v)}")
           PY
 
       - name: Run pipeline (debug wrapper)
         shell: bash
         env:
-          # ---- secrets ----
+          # Secrets
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           STATE_PATH: ${{ secrets.STATE_PATH }}
 
-          # ---- runtime knobs ----
+          # Repo variables (plain text)
+          LOGS_DIR: ${{ vars.LOGS_DIR }}
+          STAGE00_IN: ${{ vars.STAGE00_IN }}
+          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
+          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
+          STAGE10_IN: ${{ vars.STAGE10_IN }}
+          STAGE10_OUT: ${{ vars.STAGE10_OUT }}
+          STAGE10_DONE: ${{ vars.STAGE10_DONE }}
+          STAGE20_IN: ${{ vars.STAGE20_IN }}
+          STAGE20_OUT: ${{ vars.STAGE20_OUT }}
+          STAGE20_DONE: ${{ vars.STAGE20_DONE }}
+          STAGE30_IN: ${{ vars.STAGE30_IN }}
+          STAGE30_OUT: ${{ vars.STAGE30_OUT }}
+          STAGE30_DONE: ${{ vars.STAGE30_DONE }}
+          STAGE40_IN: ${{ vars.STAGE40_IN }}
+          STAGE40_OUT: ${{ vars.STAGE40_OUT }}
+          STAGE40_DONE: ${{ vars.STAGE40_DONE }}
+
+          # Controls
+          MONTHLY_STAGE: ${{ inputs.monthly_stage }}
           OPENAI_MODEL: gpt-5-mini
           DEPTH: medium
           OPENAI_TIMEOUT: "120"
@@ -128,97 +127,9 @@ jobs:
           MAX_INPUT_CHARS: "80000"
           PYTHONUNBUFFERED: "1"
 
-          # ---- stage selector ----
-          MONTHLY_STAGE: ${{ inputs.MONTHLY_STAGE }}
-
-          # ---- repository variables (paths) ----
-          LOGS_DIR: ${{ vars.LOGS_DIR }}
-
-          STAGE00_IN: ${{ vars.STAGE00_IN }}
-          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
-          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
-
-          STAGE10_IN: ${{ vars.STAGE10_IN }}
-          STAGE10_OUT: ${{ vars.STAGE10_OUT }}
-          STAGE10_DONE: ${{ vars.STAGE10_DONE }}
-
-          STAGE20_IN: ${{ vars.STAGE20_IN }}
-          STAGE20_OUT: ${{ vars.STAGE20_OUT }}
-          STAGE20_DONE: ${{ vars.STAGE20_DONE }}
-
-          STAGE30_IN: ${{ vars.STAGE30_IN }}
-          STAGE30_OUT: ${{ vars.STAGE30_OUT }}
-          STAGE30_DONE: ${{ vars.STAGE30_DONE }}
-
-          STAGE40_IN: ${{ vars.STAGE40_IN }}
-          STAGE40_OUT: ${{ vars.STAGE40_OUT }}
-          STAGE40_DONE: ${{ vars.STAGE40_DONE }}
         run: |
           set -euxo pipefail
           python -V
-
-          # ---- guard: stage vars must exist ----
-          : "${MONTHLY_STAGE:?MONTHLY_STAGE is required}"
-
-          # ---- map STAGE vars -> legacy MONTHLY_* vars (code expects these) ----
-          case "${MONTHLY_STAGE}" in
-            00)
-              export MONTHLY_INBOX_PATH="${STAGE00_IN}"
-              export MONTHLY_PREP_DIR="${STAGE10_IN}"
-              export MONTHLY_OVERVIEW_DIR="${STAGE20_IN}"
-              export MONTHLY_OUTBOX_DIR="${STAGE30_IN}"
-              ;;
-            10)
-              export MONTHLY_INBOX_PATH="${STAGE10_IN}"
-              export MONTHLY_PREP_DIR="${STAGE10_IN}"
-              export MONTHLY_OVERVIEW_DIR="${STAGE20_IN}"
-              export MONTHLY_OUTBOX_DIR="${STAGE30_IN}"
-              ;;
-            20)
-              export MONTHLY_INBOX_PATH="${STAGE20_IN}"
-              export MONTHLY_PREP_DIR="${STAGE10_IN}"
-              export MONTHLY_OVERVIEW_DIR="${STAGE20_IN}"
-              export MONTHLY_OUTBOX_DIR="${STAGE30_IN}"
-              ;;
-            30)
-              export MONTHLY_INBOX_PATH="${STAGE30_IN}"
-              export MONTHLY_PREP_DIR="${STAGE10_IN}"
-              export MONTHLY_OVERVIEW_DIR="${STAGE20_IN}"
-              export MONTHLY_OUTBOX_DIR="${STAGE30_IN}"
-              ;;
-            40)
-              export MONTHLY_INBOX_PATH="${STAGE40_IN}"
-              export MONTHLY_PREP_DIR="${STAGE10_IN}"
-              export MONTHLY_OVERVIEW_DIR="${STAGE20_IN}"
-              export MONTHLY_OUTBOX_DIR="${STAGE30_IN}"
-              ;;
-            *)
-              echo "Unknown MONTHLY_STAGE='${MONTHLY_STAGE}' (expected 00/10/20/30/40)" >&2
-              exit 1
-              ;;
-          esac
-
-          # ---- sanity (no secret leak, but show the resolved path) ----
-          echo "[stage-map] MONTHLY_STAGE=${MONTHLY_STAGE}"
-          echo "[stage-map] MONTHLY_INBOX_PATH=${MONTHLY_INBOX_PATH}"
-          echo "[stage-map] MONTHLY_PREP_DIR=${MONTHLY_PREP_DIR}"
-          echo "[stage-map] MONTHLY_OVERVIEW_DIR=${MONTHLY_OVERVIEW_DIR}"
-          echo "[stage-map] MONTHLY_OUTBOX_DIR=${MONTHLY_OUTBOX_DIR}"
-          echo "[stage-map] LOGS_DIR=${LOGS_DIR:-}"
-
-          # ---- basic validation to fail fast ----
-          for p in "${MONTHLY_INBOX_PATH}" "${MONTHLY_PREP_DIR}" "${MONTHLY_OVERVIEW_DIR}" "${MONTHLY_OUTBOX_DIR}"; do
-            if [[ -z "${p}" ]]; then
-              echo "ERROR: resolved path is empty. Check repository variables STAGE**_IN." >&2
-              exit 1
-            fi
-            if [[ "${p}" != /* ]]; then
-              echo "ERROR: resolved path must start with '/': ${p}" >&2
-              exit 1
-            fi
-          done
-
-          # ---- debug wrapper: force error visibility ----
           python - <<'PY'
           import runpy, sys, traceback
           try:
