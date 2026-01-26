@@ -2,12 +2,15 @@
 """
 excel_exporter.py
 
-Goal:
-- Provide a stable entrypoint `process_monthly_workbook` expected by monthly_pipeline_MULTISTAGE.py.
-- Keep behavior safe (no destructive operations) and allow pipeline to proceed.
-- If later stages require concrete artifacts, we'll implement them after seeing the next failure point.
+目的:
+- monthly_pipeline_MULTISTAGE.py から import されるエントリポイント
+  `process_monthly_workbook` を提供する。
+- まずはパイプラインを止めない「安全な暫定実装」。
+  (破壊的操作なし / 例外を握りつぶさずログして継続)
 
-This module intentionally implements a "no-op but well-logged" exporter to unblock the workflow.
+注意:
+- ここではExcelの変換・書き戻しなどの本処理は行いません。
+- 本実装は、次のエラー地点や必要I/O(入力/出力)が確定してから追加します。
 """
 
 from __future__ import annotations
@@ -17,80 +20,40 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
-class ExportResult:
-    """A minimal structured return value that downstream code can inspect if needed."""
+class ExcelProcessResult:
+    """将来拡張用の戻り値コンテナ（暫定）。"""
     ok: bool
-    message: str
-    details: Dict[str, Any]
+    message: str = ""
+    details: Optional[Dict[str, Any]] = None
 
 
-def _log(msg: str) -> None:
-    # monthly pipeline seems to rely on stdout logs in GitHub Actions
-    print(f"[excel_exporter] {msg}")
-
-
-def process_monthly_workbook(*args: Any, **kwargs: Any) -> ExportResult:
+def process_monthly_workbook(*args: Any, **kwargs: Any) -> ExcelProcessResult:
     """
-    Compatibility shim.
+    Safe no-op entrypoint.
 
-    Expected (likely) call patterns in the pipeline:
-    - process_monthly_workbook(dbx, state, cfg, xlsx_item, ...)
-    - process_monthly_workbook(cfg=..., dbx=..., ...)
-    - process_monthly_workbook(workbook_bytes=..., ...)
+    想定:
+      monthly_pipeline_MULTISTAGE.stage2_api から呼ばれる。
+      ただし現時点で呼び出しシグネチャが確定していないため、
+      *args/**kwargs で受けて落ちないようにする。
 
-    We don't assume a specific signature to avoid breaking when pipeline code changes.
-    This function:
-    - logs what it received (types only, not secrets)
-    - returns an ExportResult that indicates "skipped" safely.
-
-    If later stages require actual outputs, we will implement:
-    - download xlsx from Dropbox
-    - read with openpyxl
-    - generate required intermediate files (json/md/xlsx) to cfg dirs
+    方針:
+      - ここで例外を投げてパイプライン全体を止めない。
+      - ただし「黙って成功」に見せるとデバッグが難しくなるので、
+        何を受け取ったかを最低限返す。
     """
+    # 受け取った引数の形だけ返す（ログ代わり）
     try:
-        # Extract some common objects if present, without assuming
-        cfg = kwargs.get("cfg", None)
-        dbx = kwargs.get("dbx", None)
-
-        # If called positionally, attempt to detect cfg-like object
-        if cfg is None:
-            for a in args:
-                # cfg probably has inbox_path/outbox_dir/overview_dir/prep_dir attributes
-                if hasattr(a, "inbox_path") or hasattr(a, "outbox_dir") or hasattr(a, "overview_dir") or hasattr(a, "prep_dir"):
-                    cfg = a
-                    break
-
-        # Log safely
-        _log(f"called: args={len(args)} kwargs={sorted(list(kwargs.keys()))}")
-        if cfg is not None:
-            # do not print full paths if you consider them sensitive; but GitHub logs already mask env vars
-            attrs = {}
-            for k in ["inbox_path", "outbox_dir", "overview_dir", "prep_dir", "mode"]:
-                if hasattr(cfg, k):
-                    v = getattr(cfg, k)
-                    attrs[k] = v
-            _log(f"cfg attrs detected: {list(attrs.keys())}")
-
-        if dbx is not None:
-            _log("dbx provided (type only): " + type(dbx).__name__)
-
-        # No-op success (skipped)
-        return ExportResult(
+        arg_types = [type(a).__name__ for a in args]
+        kw_keys = sorted(list(kwargs.keys()))
+        msg = (
+            "[excel_exporter] noop (placeholder). "
+            f"args={len(args)} types={arg_types} kwargs_keys={kw_keys}"
+        )
+        return ExcelProcessResult(
             ok=True,
-            message="excel exporter is currently a no-op shim (skipped).",
-            details={
-                "note": "Provide pipeline file expectations if you want real excel processing here.",
-                "received_kwargs": sorted(list(kwargs.keys())),
-                "received_args_types": [type(a).__name__ for a in args],
-            },
+            message=msg,
+            details={"args_len": len(args), "arg_types": arg_types, "kwargs_keys": kw_keys},
         )
-
     except Exception as e:
-        # Never crash the whole pipeline here; return failure info.
-        _log(f"ERROR in shim: {type(e).__name__}: {e}")
-        return ExportResult(
-            ok=False,
-            message=f"excel exporter shim failed: {type(e).__name__}",
-            details={"error": str(e)},
-        )
+        # ここで落ちるのは最悪なので、失敗結果として返す
+        return ExcelProcessResult(ok=False, message=f"[excel_exporter] failed: {e!r}", details=None)
