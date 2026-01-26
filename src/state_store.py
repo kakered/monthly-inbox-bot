@@ -1,43 +1,25 @@
 # -*- coding: utf-8 -*-
-"""
-state_store.py
-
-StateStore: keeps track of processed file keys (path_lower).
-This version is compatible with DropboxIO providing read_file_bytes / write_file_bytes.
-"""
-
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Optional
+
+from .state import PipelineState
+from .dropbox_io import DropboxIO
 
 
-@dataclass
-class StateStore:
-    state_path: str
-    data: Dict[str, Any] = field(default_factory=lambda: {"processed": {}})
+def load_state(dbx: DropboxIO, path: str) -> PipelineState:
+    raw = dbx.read_bytes_or_none(path)
+    if raw is None:
+        return PipelineState()
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        # If corrupted, start fresh instead of crashing
+        return PipelineState()
+    return PipelineState.from_dict(obj)
 
-    @classmethod
-    def load(cls, dbx, state_path: str) -> "StateStore":
-        try:
-            raw = dbx.read_file_bytes(state_path)
-            data = json.loads(raw.decode("utf-8", errors="replace"))
-            if not isinstance(data, dict):
-                data = {"processed": {}}
-        except Exception:
-            data = {"processed": {}}
-        if "processed" not in data or not isinstance(data["processed"], dict):
-            data["processed"] = {}
-        return cls(state_path=state_path, data=data)
 
-    def save(self, dbx) -> None:
-        payload = json.dumps(self.data, ensure_ascii=False, indent=2).encode("utf-8")
-        dbx.write_file_bytes(self.state_path, payload)
-
-    def is_processed(self, key: str) -> bool:
-        return key in self.data.get("processed", {})
-
-    def mark_processed(self, key: str, rev: Optional[str] = None) -> None:
-        # rev is optional; keep compatibility with callers
-        self.data.setdefault("processed", {})[key] = rev or "done"
+def save_state(dbx: DropboxIO, path: str, state: PipelineState) -> None:
+    data = json.dumps(state.to_dict(), ensure_ascii=False, indent=2).encode("utf-8")
+    dbx.write_bytes(path, data, mode="overwrite")
