@@ -225,7 +225,7 @@ def stage1_prep(dbx: DropboxIO, state: StateStore, cfg: MonthlyMultiStageConfig)
     items = dbx.list_folder(cfg.inbox_path)
 
     # filter xlsx only
-    xlsx_items = [it for it in items if getattr(it, "name", "").lower().endswith(".xlsx")]
+    xlsx_items = [it for it in items if (getattr(it, "name", "") or "").lower().endswith(".xlsx")]
     if not xlsx_items:
         return
 
