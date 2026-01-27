@@ -2,177 +2,142 @@
 """
 dropbox_io.py
 
-Dropbox I/O wrapper.
+Dropbox helper:
+- Prefer OAuth refresh token (DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET)
+- Fallback to DROPBOX_ACCESS_TOKEN if provided (optional)
 
-Auth (either):
-- DROPBOX_ACCESS_TOKEN  (legacy)
-- DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET (recommended)
+This file must NOT contain merge-conflict markers.
 """
+
 from __future__ import annotations
 
-import json
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import dropbox
-from dropbox import files
-from dropbox.exceptions import ApiError, AuthError
+from dropbox.files import FileMetadata, FolderMetadata
 
 
-def _env(name: str) -> str:
-    return (os.environ.get(name) or "").strip()
+def _must_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
 
 
 def _norm_path(p: str) -> str:
-    """
-    Normalize Dropbox path:
-    - "" or "/" -> "" (root)
-    - otherwise ensure starts with "/"
-    """
     p = (p or "").strip()
-    if p in ("", "/"):
-        return ""
     if not p.startswith("/"):
         p = "/" + p
-    if len(p) > 1 and p.endswith("/"):
-        p = p.rstrip("/")
+    # Dropbox treats '//' oddly; normalize a bit
+    while "//" in p:
+        p = p.replace("//", "/")
     return p
 
 
-@dataclass(frozen=True)
-class DropboxItem:
-    name: str
-    path_display: str
-    is_file: bool
-    is_folder: bool
+@dataclass
+class DropboxIO:
+    dbx: dropbox.Dropbox
 
     @staticmethod
-    def from_metadata(md: files.Metadata) -> "DropboxItem":
-        name = getattr(md, "name", "") or ""
-        path_display = getattr(md, "path_display", "") or getattr(md, "path_lower", "") or ""
-        is_file = isinstance(md, files.FileMetadata)
-        is_folder = isinstance(md, files.FolderMetadata)
-        return DropboxItem(name=name, path_display=path_display, is_file=is_file, is_folder=is_folder)
-
-
-class DropboxIO:
-    def __init__(
-        self,
-        *,
-        access_token: Optional[str] = None,
-        refresh_token: Optional[str] = None,
-        app_key: Optional[str] = None,
-        app_secret: Optional[str] = None,
-        timeout: int = 120,
-    ) -> None:
-        self.timeout = int(timeout)
-
-        if access_token:
-            self.dbx = dropbox.Dropbox(oauth2_access_token=access_token, timeout=self.timeout)
-        elif refresh_token and app_key and app_secret:
-            self.dbx = dropbox.Dropbox(
-                oauth2_refresh_token=refresh_token,
+    def from_env() -> "DropboxIO":
+        # Prefer refresh token method (recommended)
+        refresh = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
+        if refresh:
+            app_key = _must_env("DROPBOX_APP_KEY").strip()
+            app_secret = _must_env("DROPBOX_APP_SECRET").strip()
+            dbx = dropbox.Dropbox(
+                oauth2_refresh_token=refresh,
                 app_key=app_key,
                 app_secret=app_secret,
-                timeout=self.timeout,
+                timeout=120,
             )
-        else:
-            raise RuntimeError(
-                "Dropbox auth not configured. Set either:\n"
-                "  - DROPBOX_ACCESS_TOKEN\n"
-                "  OR\n"
-                "  - DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET"
-            )
+            return DropboxIO(dbx=dbx)
 
-        try:
-            self.dbx.users_get_current_account()
-        except AuthError as e:
-            raise RuntimeError(f"Dropbox auth failed: {e!r}") from e
-
-    @classmethod
-    def from_env(cls) -> "DropboxIO":
-        access = _env("DROPBOX_ACCESS_TOKEN")
-        refresh = _env("DROPBOX_REFRESH_TOKEN")
-        app_key = _env("DROPBOX_APP_KEY")
-        app_secret = _env("DROPBOX_APP_SECRET")
-        timeout = int(_env("OPENAI_TIMEOUT") or "120")
-
+        # Optional: access token
+        access = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
         if access:
-            return cls(access_token=access, timeout=timeout)
-
-        if refresh and app_key and app_secret:
-            return cls(refresh_token=refresh, app_key=app_key, app_secret=app_secret, timeout=timeout)
+            dbx = dropbox.Dropbox(oauth2_access_token=access, timeout=120)
+            return DropboxIO(dbx=dbx)
 
         raise RuntimeError(
-            "Missing Dropbox env vars. Provide either:\n"
-            "  DROPBOX_ACCESS_TOKEN\n"
-            "or\n"
-            "  DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET"
+            "Missing Dropbox credentials. Provide either "
+            "(DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET) "
+            "or DROPBOX_ACCESS_TOKEN."
         )
 
-    # ---------- folders ----------
     def ensure_folder(self, path: str) -> None:
-        p = _norm_path(path)
-        if p == "":
+        path = _norm_path(path)
+        if path == "/":
             return
         try:
-            self.dbx.files_create_folder_v2(p)
-        except ApiError as e:
-            # ignore "already exists"
-            try:
-                if e.error.is_path() and e.error.get_path().is_conflict():
-                    return
-            except Exception:
-                pass
-            raise
+            self.dbx.files_get_metadata(path)
+            return
+        except dropbox.exceptions.ApiError:
+            pass
 
-    def list_folder(self, path: str, recursive: bool = False) -> List[DropboxItem]:
-        p = _norm_path(path)
-        res = self.dbx.files_list_folder(p, recursive=recursive)
-        entries = list(res.entries)
-        while res.has_more:
+        # Create recursively
+        parts = [p for p in path.split("/") if p]
+        cur = ""
+        for part in parts:
+            cur = _norm_path(cur + "/" + part)
+            try:
+                self.dbx.files_get_metadata(cur)
+            except dropbox.exceptions.ApiError:
+                try:
+                    self.dbx.files_create_folder_v2(cur)
+                except dropbox.exceptions.ApiError:
+                    # race / already exists
+                    pass
+
+    def list_files(self, folder: str) -> List[FileMetadata]:
+        folder = _norm_path(folder)
+        out: List[FileMetadata] = []
+        res = self.dbx.files_list_folder(folder)
+        while True:
+            for e in res.entries:
+                if isinstance(e, FileMetadata):
+                    out.append(e)
+            if not res.has_more:
+                break
             res = self.dbx.files_list_folder_continue(res.cursor)
-            entries.extend(res.entries)
-        return [DropboxItem.from_metadata(md) for md in entries]
+        return out
 
-    # ---------- read/write ----------
-    def read_bytes_or_none(self, path: str) -> Optional[bytes]:
-        p = _norm_path(path)
+    def download(self, path: str) -> bytes:
+        path = _norm_path(path)
+        md, resp = self.dbx.files_download(path)
+        return resp.content
+
+    def upload(self, path: str, data: bytes, overwrite: bool = True) -> None:
+        path = _norm_path(path)
+        mode = dropbox.files.WriteMode.overwrite if overwrite else dropbox.files.WriteMode.add
+        self.dbx.files_upload(data, path, mode=mode, mute=True)
+
+    def move(self, src: str, dst: str, overwrite: bool = True) -> None:
+        src = _norm_path(src)
+        dst = _norm_path(dst)
         try:
-            _meta, resp = self.dbx.files_download(p)
-            return resp.content
-        except ApiError as e:
+            self.dbx.files_move_v2(
+                src,
+                dst,
+                autorename=False,
+                allow_shared_folder=True,
+                allow_ownership_transfer=False,
+            )
+        except dropbox.exceptions.ApiError:
+            if not overwrite:
+                raise
+            # Overwrite by deleting dst then moving
             try:
-                if e.error.is_path() and e.error.get_path().is_not_found():
-                    return None
-            except Exception:
+                self.dbx.files_delete_v2(dst)
+            except dropbox.exceptions.ApiError:
                 pass
-            raise
-
-    def read_bytes(self, path: str) -> bytes:
-        b = self.read_bytes_or_none(path)
-        if b is None:
-            raise FileNotFoundError(path)
-        return b
-
-    def write_bytes(self, path: str, data: bytes, *, overwrite: bool = True) -> None:
-        p = _norm_path(path)
-        mode = files.WriteMode.overwrite if overwrite else files.WriteMode.add
-        self.dbx.files_upload(data, p, mode=mode)
-
-    def move(self, src: str, dst: str, *, overwrite: bool = True) -> None:
-        s = _norm_path(src)
-        d = _norm_path(dst)
-        self.dbx.files_move_v2(s, d, autorename=(not overwrite))
-
-    # ---------- json ----------
-    def read_json_or_none(self, path: str) -> Optional[Any]:
-        raw = self.read_bytes_or_none(path)
-        if raw is None:
-            return None
-        return json.loads(raw.decode("utf-8"))
-
-    def write_json(self, path: str, obj: Any, *, overwrite: bool = True) -> None:
-        data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
-        self.write_bytes(path, data, overwrite=overwrite)
+            self.dbx.files_move_v2(
+                src,
+                dst,
+                autorename=False,
+                allow_shared_folder=True,
+                allow_shared_folder=True,
+            )
