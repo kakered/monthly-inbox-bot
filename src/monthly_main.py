@@ -1,26 +1,28 @@
 # -*- coding: utf-8 -*-
 """
 monthly_main.py
-
-Entry point for GitHub Actions (Monthly pipeline).
-- Loads config from env (MonthlyCfg)
-- Builds Dropbox client (refresh token preferred)
-- Runs stage switch pipeline
+Entry point for GitHub Actions.
 """
-
 from __future__ import annotations
+
+import sys
+import traceback
 
 from src.dropbox_io import DropboxIO
 from src.monthly_spec import MonthlyCfg
-from src.monthly_pipeline_MULTISTAGE import run_switch_stage
+from src.monthly_pipeline_MULTISTAGE import run_multistage
 
 
 def main() -> int:
-    dbx = DropboxIO.from_env()
-    cfg = MonthlyCfg.from_env()
-    processed = run_switch_stage(dbx, cfg)
-    print(f"[MONTHLY] Done. stage={cfg.monthly_stage} processed={processed}")
-    return 0
+    try:
+        cfg = MonthlyCfg.from_env()
+        dbx = DropboxIO.from_env()
+        run_multistage(dbx, cfg)
+        return 0
+    except Exception:
+        print("[MONTHLY] Unhandled exception:", file=sys.stderr)
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
