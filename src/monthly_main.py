@@ -2,20 +2,12 @@
 """
 monthly_main.py
 
-Entry point for GitHub Actions.
-
-Auth:
-- Recommended: DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET
-- Optional: DROPBOX_ACCESS_TOKEN
-
-Stage:
-- MONTHLY_STAGE=00 / 10 / 20
+Entry point for GitHub Actions (Monthly pipeline).
 """
-from __future__ import annotations
 
-from .dropbox_io import DropboxIO
-from .monthly_spec import MonthlyCfg
-from .monthly_pipeline_MULTISTAGE import run_switch_stage
+from src.dropbox_io import DropboxIO
+from src.monthly_spec import MonthlyCfg
+from src.monthly_pipeline_MULTISTAGE import run_switch_stage
 
 
 def main() -> int:
