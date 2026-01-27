@@ -1,154 +1,98 @@
 # -*- coding: utf-8 -*-
-"""
-monthly_spec.py
-
-Env/config loader.
-
-Folder convention (Dropbox):
-<ROOT>/IN   : input
-<ROOT>/DONE : processed inputs
-<ROOT>/OUT  : outputs (final for last stage)
-
-Roots (defaults):
-- /00_inbox_raw
-- /10_preformat_py
-- /20_overview_api
-- /30_personalize_py
-System:
-- /_system/state.json
-- /_system/logs
-"""
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+"""Monthly report (月報) pipeline specification.
 
+このファイルは、excel_exporter / monthly_pipeline_MULTISTAGE が参照する「列名・プロンプト・定数」を一箇所に集約するための定義です。
+（ここに無い名前を import しようとして落ちる事故を防ぐ目的もあります）
+"""
 
-<<<<<<< HEAD
-def _getenv(name: str, default: str) -> str:
-    v = os.getenv(name, "").strip()
-    return v if v else default
+from typing import List, Set
 
+# -----------------------------
+# 0) Misc / safety knobs
+# -----------------------------
 
-@dataclass
-class MonthlyCfg:
-    # stage roots (NOT including /IN,/OUT,/DONE)
-    inbox_root: str
-    prep_root: str
-    overview_root: str
-    outbox_root: str
+# マスキング/除外したい「見出し候補」（必要なら運用に合わせて追加）
+SENSITIVE_HEADER_NAMES: Set[str] = {
+    "氏名",
+    "名前",
+    "メール",
+    "住所",
+    "電話",
+}
 
-    state_path: str
-    logs_dir: str
-    mode: str = "multistage"
+# ざっくりのポジ/ネガ判定に使うキーワード（未使用でも互換のため残す）
+POSITIVE_KEYWORDS: List[str] = [
+    "良かった", "できた", "達成", "改善", "感謝", "助かった", "順調",
+]
+NEGATIVE_KEYWORDS: List[str] = [
+    "できない", "難しい", "困った", "ミス", "トラブル", "遅れ", "不安",
+]
 
-    @staticmethod
-    def from_env() -> "MonthlyCfg":
-        # IMPORTANT: roots only
-        inbox_root = _getenv("MONTHLY_INBOX_PATH", "/00_inbox_raw")
-        prep_root = _getenv("MONTHLY_PREP_DIR", "/10_preformat_py")
-        overview_root = _getenv("MONTHLY_OVERVIEW_DIR", "/20_overview_api")
-        outbox_root = _getenv("MONTHLY_OUTBOX_DIR", "/30_personalize_py")
+# -----------------------------
+# 1) Canonical input columns (Stage1 PREP sheet)
+# -----------------------------
+# Stage1(=API無し)で作るシート "INPUT" のヘッダ。以降はこの名前を前提に処理します。
+# ※ユーザー最新仕様：社員番号/一致確認用/就業先 は廃止
+INPUT_CANONICAL_COLUMNS: List[str] = [
+    "Person_ID",
+    "Month",
+    "HumanRelations_ReportLine",   # 人間関係（報連相）
+    "Work_QuantityQuality",        # 仕事の量・質（同一セル）
+    "Proactivity",                 # 積極性
+    "Responsibility",              # 責任性
+    "NearMiss",                    # ヒヤリハットの抽出・分析・対策
+    "Site_Improvement",            # 就業先での業務改善提案
+    "HQ_Request",                  # 本社への相談・要望
+]
 
-        state_path = _getenv("MONTHLY_STATE_PATH", "/_system/state.json")
-        logs_dir = _getenv("MONTHLY_LOGS_DIR", "/_system/logs")
-        mode = _getenv("MONTHLY_MODE", "multistage")
+# -----------------------------
+# 2) Output columns (Overview / Per-person)
+# -----------------------------
+# 「出力ファイルイメージver2.xlsx」の趣旨：ID+月+原文（各項目）+ Draft_Feedback
+OVERVIEW_OUTPUT_COLUMNS: List[str] = [
+    "Person_ID",
+    "Month",
+    "HumanRelations_ReportLine",
+    "Work_QuantityQuality",
+    "Proactivity",
+    "Responsibility",
+    "NearMiss",
+    "Site_Improvement",
+    "HQ_Request",
+    "Draft_Feedback",
+]
 
-        return MonthlyCfg(
-=======
-def _env(name: str, default: str = "") -> str:
-    return (os.environ.get(name) or default).strip()
+# 現状は「個人別」も同じ列でOK（必要になったら追加列をここに足す）
+PER_PERSON_OUTPUT_COLUMNS: List[str] = list(OVERVIEW_OUTPUT_COLUMNS)
 
+# -----------------------------
+# 3) OpenAI prompt (draft feedback)
+# -----------------------------
+FEEDBACK_DRAFT_SYSTEM: str = """あなたは、対象者と同じ職場で日常的に業務を見ている立場の、落ち着いた現場の先輩です。
 
-def _norm_root(p: str) -> str:
-    p = (p or "").strip()
-    if not p:
-        return ""
-    if not p.startswith("/"):
-        p = "/" + p
-    if len(p) > 1 and p.endswith("/"):
-        p = p.rstrip("/")
-    return p
+目的：
+「実際のフィードバック担当者が、要点を絞って、少し丁寧に書いた」
+と自然に読める月報フィードバック草案を作る。
 
+必ず守ること：
+- 偉そうに評価しない
+- 押し付けない
+- 原文に書かれていない背景・意図・性格を推測しない
+- 一緒の部署で見ている視点だが、憶測で断定しない
+- 良い点を必ず拾う（最低1つ）
+- 事実(原文)と提案(あなたの言葉)を混同しない
+"""
 
-def _join(root: str, sub: str) -> str:
-    root = _norm_root(root)
-    sub = (sub or "").strip().lstrip("/")
-    if not root:
-        return "/" + sub if sub else ""
-    return root + ("/" + sub if sub else "")
+FEEDBACK_DRAFT_PROMPT_JP: str = """以下の形式で出力してください（余計な見出しは増やさない）。
 
+【良い点】
+- 1〜3点
 
-@dataclass(frozen=True)
-class MonthlyCfg:
-    stage: str
+【気になった点 / リスク】
+- 0〜2点（無ければ「特になし」でも可）
 
-    inbox_root: str
-    prep_root: str
-    overview_root: str
-    outbox_root: str
-
-    state_path: str
-    logs_dir: str
-
-    max_files_per_run: int
-    max_input_chars: int
-
-    openai_model: str
-    depth: str
-
-    @staticmethod
-    def from_env() -> "MonthlyCfg":
-        stage = (_env("MONTHLY_STAGE", "00") or "00").strip()
-        if stage.isdigit() and len(stage) == 1:
-            stage = f"0{stage}"
-
-        inbox_root = _norm_root(_env("MONTHLY_INBOX_PATH", "/00_inbox_raw") or "/00_inbox_raw")
-        prep_root = _norm_root(_env("MONTHLY_PREP_DIR", "/10_preformat_py") or "/10_preformat_py")
-        overview_root = _norm_root(_env("MONTHLY_OVERVIEW_DIR", "/20_overview_api") or "/20_overview_api")
-        outbox_root = _norm_root(_env("MONTHLY_OUTBOX_DIR", "/30_personalize_py") or "/30_personalize_py")
-
-        state_path = _norm_root(_env("MONTHLY_STATE_PATH", _env("STATE_PATH", "/_system/state.json")) or "/_system/state.json")
-        logs_dir = _norm_root(_env("MONTHLY_LOGS_DIR", _env("LOGS_DIR", "/_system/logs")) or "/_system/logs")
-
-        max_files_per_run = int(_env("MAX_FILES_PER_RUN", "200"))
-        max_input_chars = int(_env("MAX_INPUT_CHARS", "80000"))
-        openai_model = _env("OPENAI_MODEL", "gpt-5-mini")
-        depth = _env("DEPTH", "medium")
-
-        return MonthlyCfg(
-            stage=stage,
->>>>>>> dev
-            inbox_root=inbox_root,
-            prep_root=prep_root,
-            overview_root=overview_root,
-            outbox_root=outbox_root,
-            state_path=state_path,
-            logs_dir=logs_dir,
-<<<<<<< HEAD
-            mode=mode,
-        )
-=======
-            max_files_per_run=max_files_per_run,
-            max_input_chars=max_input_chars,
-            openai_model=openai_model,
-            depth=depth,
-        )
-
-    # derived folders
-    def inbox_in(self) -> str: return _join(self.inbox_root, "IN")
-    def inbox_done(self) -> str: return _join(self.inbox_root, "DONE")
-    def inbox_out(self) -> str: return _join(self.inbox_root, "OUT")
-
-    def prep_in(self) -> str: return _join(self.prep_root, "IN")
-    def prep_done(self) -> str: return _join(self.prep_root, "DONE")
-    def prep_out(self) -> str: return _join(self.prep_root, "OUT")
-
-    def overview_in(self) -> str: return _join(self.overview_root, "IN")
-    def overview_done(self) -> str: return _join(self.overview_root, "DONE")
-    def overview_out(self) -> str: return _join(self.overview_root, "OUT")
-
-    def outbox_in(self) -> str: return _join(self.outbox_root, "IN")
-    def outbox_done(self) -> str: return _join(self.outbox_root, "DONE")
-    def outbox_out(self) -> str: return _join(self.outbox_root, "OUT")
->>>>>>> dev
+【次にやると良さそうなこと】
+- 1〜3点（低コスト順、具体的に）
+"""
