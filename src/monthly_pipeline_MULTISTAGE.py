@@ -2,182 +2,106 @@
 """
 monthly_pipeline_MULTISTAGE.py
 
-"Switch-ON (semi-auto)" multistage pipeline.
-- You choose which stage to run via env MONTHLY_STAGE (00/10/20/30/40)
-- Each run processes files under that stage's IN folder.
-- Outputs go to:
-    - current stage OUT (for inspection)
-    - next stage IN (for chaining without manual copy)
-- Inputs are moved to current stage DONE (so you don't need to delete IN files).
+Stage00 minimal pipeline (keeps current behavior):
+- list files from STAGE00_IN
+- copy bytes to STAGE00_OUT
+- move original to STAGE00_DONE
+- also place a copy into STAGE10_IN
+- update state.json
+- write audit JSONL into LOGS_DIR
+
+This file is intentionally minimal to avoid big refactors.
 """
+
 from __future__ import annotations
 
-import json
-import os
 import time
-from typing import Dict, List, Optional
-
 from dropbox.files import FileMetadata
 
 from .dropbox_io import DropboxIO
-from .monthly_spec import MonthlyCfg
+from .state_store import StateStore, stable_key
 
 
-def _now_tag() -> str:
-    return time.strftime("%Y%m%d-%H%M%S")
+def _run_id_default() -> str:
+    return time.strftime("%Y%m%d-%H%M%SZ", time.gmtime())
 
 
-def _join(dir_path: str, name: str) -> str:
-    dp = dir_path.rstrip("/")
-    return f"{dp}/{name}"
+def run_multistage(dbx: DropboxIO, cfg, run_id: str | None = None) -> int:
+    rid = run_id or _run_id_default()
+    store = StateStore.load(dbx, cfg.state_path)
 
+    store.audit_event(
+        run_id=rid,
+        stage="--",
+        event="run_start",
+        message="monthly pipeline start",
+        monthly_stage=cfg.monthly_stage,
+    )
 
-def _is_xlsx(name: str) -> bool:
-    return (name or "").lower().endswith(".xlsx")
+    # Only stage00 in this minimal build
+    if cfg.monthly_stage != "00":
+        store.audit_event(run_id=rid, stage=str(cfg.monthly_stage), event="skip", message="Only stage00 implemented")
+        store.save(dbx)
+        store.audit_event(run_id=rid, stage=str(cfg.monthly_stage), event="write_state", filename=cfg.state_path, message="state saved (skip)")
+        store.audit_event(run_id=rid, stage="--", event="run_end", message="monthly pipeline end (skip)")
+        store.flush_audit_jsonl(dbx, cfg.logs_dir, rid)
+        return 0
 
+    entries = dbx.list_folder(cfg.stage00_in)
+    files = [e for e in entries if isinstance(e, FileMetadata)]
+    store.audit_event(run_id=rid, stage="00", event="list", src_path=cfg.stage00_in, message=f"n={len(files)}")
 
-def _load_state(dbx: DropboxIO, path: str) -> Dict[str, Dict[str, str]]:
-    try:
-        raw = dbx.download(path)
-    except Exception:
-        return {"processed": {}}
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
-        return {"processed": {}}
+    processed_count = 0
+    for f in files:
+        if processed_count >= cfg.max_files_per_run:
+            store.audit_event(run_id=rid, stage="00", event="stop", message="max_files_per_run", limit=cfg.max_files_per_run)
+            break
 
-
-def _save_state(dbx: DropboxIO, path: str, state: Dict[str, Dict[str, str]]) -> None:
-    dbx.ensure_folder(os.path.dirname(path).replace("\\", "/"))
-    dbx.upload(path, json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8"), overwrite=True)
-
-
-def _key_for(md: FileMetadata) -> str:
-    fid = getattr(md, "id", None) or ""
-    rev = getattr(md, "rev", None) or ""
-    pl = getattr(md, "path_lower", None) or ""
-    return f"{fid}|{pl}|{rev}"
-
-
-def _list_xlsx(dbx: DropboxIO, folder: str) -> List[FileMetadata]:
-    items = dbx.list_folder(folder)
-    out: List[FileMetadata] = []
-    for it in items:
-        if isinstance(it, FileMetadata) and _is_xlsx(it.name):
-            out.append(it)
-    return out
-
-
-def _ensure_stage_dirs(dbx: DropboxIO, cfg: MonthlyCfg) -> None:
-    dbx.ensure_folder(cfg.logs_dir)
-    dbx.ensure_folder(os.path.dirname(cfg.state_path).replace("\\", "/") or "/")
-    for s in cfg.stages.values():
-        dbx.ensure_folder(s.in_dir)
-        dbx.ensure_folder(s.out_dir)
-        dbx.ensure_folder(s.done_dir)
-
-
-def run_multistage(dbx: DropboxIO, cfg: MonthlyCfg) -> None:
-    _ensure_stage_dirs(dbx, cfg)
-    state = _load_state(dbx, cfg.state_path)
-    processed: Dict[str, str] = state.get("processed", {})
-
-    stage = cfg.stage
-    if stage not in cfg.stages:
-        raise RuntimeError(f"Invalid MONTHLY_STAGE={stage!r}. Expected one of: {sorted(cfg.stages.keys())}")
-
-    if stage == "00":
-        _stage_passthrough(dbx, cfg, processed, stage="00", next_stage="10")
-    elif stage == "10":
-        _stage_passthrough(dbx, cfg, processed, stage="10", next_stage="20")
-    elif stage == "20":
-        _stage20_overview_and_personalize(dbx, cfg, processed)
-    elif stage == "30":
-        _stage_passthrough(dbx, cfg, processed, stage="30", next_stage="40")
-    elif stage == "40":
-        _stage_passthrough(dbx, cfg, processed, stage="40", next_stage=None)
-
-    state["processed"] = processed
-    _save_state(dbx, cfg.state_path, state)
-
-
-def _stage_passthrough(dbx: DropboxIO, cfg: MonthlyCfg, processed: Dict[str, str], stage: str, next_stage: Optional[str]) -> None:
-    s = cfg.s(stage)
-    files = _list_xlsx(dbx, s.in_dir)
-    if not files:
-        print(f"[MONTHLY] stage{stage}: no .xlsx in {s.in_dir}")
-        return
-
-    for md in files[: cfg.max_files_per_run]:
-        key = _key_for(md)
-        if processed.get(key):
-            continue
-
-        src = md.path_display or md.path_lower
+        src = f.path_display or f.path_lower or ""
         if not src:
             continue
 
-        tag = _now_tag()
-        base = md.name.rsplit(".", 1)[0]
-        out_name = f"{base}__stage{stage}__{tag}.xlsx"
+        base = src.split("/")[-1]
+        key = stable_key(src)
 
-        out_path = _join(s.out_dir, out_name)
-        dbx.copy(src, out_path)
-
-        if next_stage:
-            ns = cfg.s(next_stage)
-            next_in_path = _join(ns.in_dir, out_name)
-            dbx.copy(src, next_in_path)
-
-        done_path = _join(s.done_dir, md.name)
-        dbx.move(src, done_path)
-
-        processed[key] = f"stage{stage}:{tag}"
-        print(f"[MONTHLY] stage{stage}: {md.name} -> OUT/DONE" + (f" + next stage {next_stage} IN" if next_stage else ""))
-
-
-def _stage20_overview_and_personalize(dbx: DropboxIO, cfg: MonthlyCfg, processed: Dict[str, str]) -> None:
-    from .excel_exporter import process_monthly_workbook  # stage20 only
-
-    s20 = cfg.s("20")
-    s30 = cfg.s("30")
-
-    files = _list_xlsx(dbx, s20.in_dir)
-    if not files:
-        print(f"[MONTHLY] stage20: no .xlsx in {s20.in_dir}")
-        return
-
-    for md in files[: cfg.max_files_per_run]:
-        key = _key_for(md)
-        if processed.get(key):
+        if store.is_processed(key):
+            store.audit_event(run_id=rid, stage="00", event="skip", src_path=src, filename=base, message="already_processed")
             continue
 
-        src = md.path_display or md.path_lower
-        if not src:
-            continue
+        try:
+            b = dbx.download_to_bytes(src)
 
-        xlsx = dbx.download(src)
-        tag = _now_tag()
-        base = md.name.rsplit(".", 1)[0]
+            out_path = f"{cfg.stage00_out.rstrip('/')}/{base}"
+            done_path = f"{cfg.stage00_done.rstrip('/')}/{base}"
+            next_in_path = f"{cfg.stage10_in.rstrip('/')}/{base}"
 
-        overview_bytes, per_person_bytes = process_monthly_workbook(
-            xlsx,
-            model=cfg.openai_model,
-            depth=cfg.depth,
-            timeout=cfg.openai_timeout,
-            source_name=md.name,
-        )
+            dbx.write_file_bytes(out_path, b, overwrite=True)
+            store.audit_event(run_id=rid, stage="00", event="write", src_path=src, dst_path=out_path, filename=base, size=len(b))
 
-        ov_name = f"{base}__overview__{tag}.xlsx"
-        pp_name = f"{base}__personalize__{tag}.xlsx"
+            dbx.move(src, done_path)
+            store.audit_event(run_id=rid, stage="00", event="move", src_path=src, dst_path=done_path, filename=base)
 
-        dbx.upload(_join(s20.out_dir, ov_name), overview_bytes, overwrite=True)
-        dbx.upload(_join(s20.out_dir, pp_name), per_person_bytes, overwrite=True)
+            dbx.write_file_bytes(next_in_path, b, overwrite=True)
+            store.audit_event(run_id=rid, stage="10", event="write", src_path=done_path, dst_path=next_in_path, filename=base, size=len(b))
 
-        dbx.upload(_join(s30.in_dir, ov_name), overview_bytes, overwrite=True)
-        dbx.upload(_join(s30.in_dir, pp_name), per_person_bytes, overwrite=True)
+            store.add_done(src_path=src)
+            store.mark_processed(key, f"stage00:{rid}")
+            processed_count += 1
 
-        dbx.move(src, _join(s20.done_dir, md.name))
+            # keep your existing console style
+            print(f"[MONTHLY] stage00: {base} -> OUT/DONE + next stage 10 IN")
 
-        processed[key] = f"stage20:{tag}"
-        print(f"[MONTHLY] stage20: {md.name} -> OUT + stage30 IN; moved to DONE")
+        except Exception as e:
+            store.audit_event(run_id=rid, stage="00", event="error", src_path=src, filename=base, message=str(e))
+            store.add_error({"run_id": rid, "stage": "00", "src": src, "error": str(e)})
+
+    # Persist state + audit
+    try:
+        store.save(dbx)
+        store.audit_event(run_id=rid, stage="00", event="write_state", filename=cfg.state_path, message="state saved")
+    except Exception as e:
+        store.audit_event(run_id=rid, stage="--", event="error", message=f"state_save_failed: {e}")
+
+    store.audit_event(run_id=rid, stage="--", event="run_end", message="monthly pipeline end")
+    store.flush_audit_jsonl(dbx, cfg.logs_dir, rid)
+    return 0
