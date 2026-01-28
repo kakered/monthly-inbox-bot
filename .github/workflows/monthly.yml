@@ -88,16 +88,7 @@ jobs:
               print(f"{k}: len={len(v)}")
           PY
 
-      # ---- Preflight: fail fast before touching Dropbox ----
-      - name: Preflight (compile + import)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -V
-          python -m compileall -q src
-          python -c "import src.monthly_main; print('import ok')"
-
-      # ---- Dropbox debug: list stage00 IN to confirm files are actually visible ----
+      # ---- Dropbox visibility check: list stage00 IN (this is the key debug) ----
       - name: Dropbox list debug (stage00 IN)
         shell: bash
         env:
@@ -129,6 +120,15 @@ jobs:
           for e in entries[:50]:
               print(type(e).__name__, getattr(e, "path_display", ""), getattr(e, "size", ""))
           PY
+
+      # ---- Preflight: fail fast before touching pipeline logic ----
+      - name: Preflight (compile + import)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -V
+          python -m compileall -q src
+          python -c "import src.monthly_main; print('import ok')"
 
       - name: Run pipeline (debug wrapper)
         shell: bash
