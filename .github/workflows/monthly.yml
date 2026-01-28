@@ -56,7 +56,7 @@ jobs:
           STAGE40_IN: ${{ vars.STAGE40_IN }}
           STAGE40_OUT: ${{ vars.STAGE40_OUT }}
           STAGE40_DONE: ${{ vars.STAGE40_DONE }}
-          # Secrets
+          # Secrets (length only)
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
@@ -88,14 +88,15 @@ jobs:
               print(f"{k}: len={len(v)}")
           PY
 
-      # ---- Dropbox debug: list IN/OUT/DONE + check state.json existence ----
-      - name: Dropbox debug (IN/OUT/DONE + state.json)
+      # ---- Dropbox debug: account + stage00 IN/OUT/DONE + state.json existence ----
+      - name: Dropbox debug (stage00 IN/OUT/DONE + state.json)
         shell: bash
         env:
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           STATE_PATH: ${{ secrets.STATE_PATH }}
+
           STAGE00_IN: ${{ vars.STAGE00_IN }}
           STAGE00_OUT: ${{ vars.STAGE00_OUT }}
           STAGE00_DONE: ${{ vars.STAGE00_DONE }}
@@ -109,7 +110,8 @@ jobs:
           tok = os.environ["DROPBOX_REFRESH_TOKEN"]
           app_key = os.environ["DROPBOX_APP_KEY"]
           app_secret = os.environ["DROPBOX_APP_SECRET"]
-          state_path = os.environ.get("STATE_PATH","")
+
+          state_path = os.environ.get("STATE_PATH", "")
           p_in = os.environ["STAGE00_IN"]
           p_out = os.environ["STAGE00_OUT"]
           p_done = os.environ["STAGE00_DONE"]
@@ -118,6 +120,16 @@ jobs:
               return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
           dbx = dropbox.Dropbox(oauth2_refresh_token=tok, app_key=app_key, app_secret=app_secret)
+
+          # Account
+          try:
+              acc = dbx.users_get_current_account()
+              print("== current_account ==")
+              print("account_id:", acc.account_id)
+              print("name:", acc.name.display_name)
+              print("email:", acc.email)
+          except Exception as e:
+              print("ERROR current_account:", repr(e))
 
           def list_folder(path: str, limit: int = 50):
               print(f"\n== list_folder: {path!r} ==")
@@ -134,11 +146,12 @@ jobs:
                   sz = getattr(e, "size", "")
                   print(t, pd, sz)
 
+          # Stage00 IN/OUT/DONE
           list_folder(p_in)
           list_folder(p_out)
           list_folder(p_done)
 
-          # Check if the target file exists somewhere (name-based)
+          # Search by name (safe)
           target = "今月の振り返り１６.xlsx"
           print(f"\n== search by name: {target} ==")
           try:
@@ -147,18 +160,18 @@ jobs:
               print("matches:", len(matches))
               for m in matches[:50]:
                   md = m.metadata.get_metadata()
-                  print(getattr(md, "path_display",""))
+                  print(getattr(md, "path_display", ""))
           except ApiError as e:
               print("ERROR search:", e)
 
-          # State file existence + minimal schema info (no content dump)
+          # State file existence + minimal schema info (no full dump)
           print(f"\n== state_path check: len={len(state_path)} sha256_12={short_hash(state_path) if state_path else 'EMPTY'} ==")
           if not state_path:
               print("STATE_PATH is EMPTY (this alone can explain 'no progress').")
           else:
               try:
                   md = dbx.files_get_metadata(state_path)
-                  print("state exists:", getattr(md, "path_display",""), "size:", getattr(md, "size",""))
+                  print("state exists:", getattr(md, "path_display", ""), "size:", getattr(md, "size", ""))
                   _, resp = dbx.files_download(state_path)
                   raw = resp.content
                   print("state download bytes:", len(raw))
@@ -166,8 +179,7 @@ jobs:
                       obj = json.loads(raw.decode("utf-8"))
                       if isinstance(obj, dict):
                           print("state json keys:", sorted(list(obj.keys()))[:50])
-                          # common helpful counts without assuming schema
-                          for k in ["processed","done","files","history","items"]:
+                          for k in ["processed", "done", "files", "history", "items"]:
                               if k in obj and isinstance(obj[k], (list, dict)):
                                   print(f"state[{k}] type={type(obj[k]).__name__} len={len(obj[k])}")
                       else:
@@ -175,7 +187,6 @@ jobs:
                   except Exception as e:
                       print("state json parse error:", repr(e))
               except ApiError as e:
-                  # Not found or permissions
                   print("state metadata error:", e)
           PY
 
@@ -226,7 +237,6 @@ jobs:
           MAX_FILES_PER_RUN: "200"
           MAX_INPUT_CHARS: "80000"
           PYTHONUNBUFFERED: "1"
-
         run: |
           set -euxo pipefail
           python -V
