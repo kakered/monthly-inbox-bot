@@ -35,11 +35,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---- Sanity check: show only lengths/hashes (no secret leak) ----
       - name: Sanity check Dropbox paths (no secret leak)
         shell: bash
         env:
-          # Repo variables (plain text)
           LOGS_DIR: ${{ vars.LOGS_DIR }}
           STAGE00_IN: ${{ vars.STAGE00_IN }}
           STAGE00_OUT: ${{ vars.STAGE00_OUT }}
@@ -56,7 +54,6 @@ jobs:
           STAGE40_IN: ${{ vars.STAGE40_IN }}
           STAGE40_OUT: ${{ vars.STAGE40_OUT }}
           STAGE40_DONE: ${{ vars.STAGE40_DONE }}
-          # Secrets
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
@@ -64,41 +61,67 @@ jobs:
           STATE_PATH: ${{ secrets.STATE_PATH }}
         run: |
           set -euxo pipefail
-          python - <<'PY'
+
+          echo "===== begin python stdin (sanity-check) ====="
+          cat <<'PY'
           import os, hashlib
 
           def short_hash(s: str) -> str:
-            return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+              return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
           keys = [
-            "LOGS_DIR",
-            "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
-            "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
-            "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
-            "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
-            "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
+              "LOGS_DIR",
+              "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
+              "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
+              "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
+              "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
+              "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
           ]
           for k in keys:
-            v = os.environ.get(k, "")
-            print(f"{k}: len={len(v)} sha256_12={short_hash(v) if v else 'EMPTY'} startswith_/={v.startswith('/') if v else False}")
+              v = os.environ.get(k, "")
+              print(f"{k}: len={len(v)} sha256_12={short_hash(v) if v else 'EMPTY'} startswith_/={v.startswith('/') if v else False}")
 
           print("== secrets present? (length only) ==")
           for k in ["OPENAI_API_KEY","DROPBOX_REFRESH_TOKEN","DROPBOX_APP_KEY","DROPBOX_APP_SECRET","STATE_PATH"]:
-            v = os.environ.get(k, "")
-            print(f"{k}: len={len(v)}")
+              v = os.environ.get(k, "")
+              print(f"{k}: len={len(v)}")
+          PY
+          echo "===== end python stdin (sanity-check) ====="
+
+          # run the same code, but do not fail the job even if it fails
+          python - <<'PY' || true
+          import os, hashlib
+
+          def short_hash(s: str) -> str:
+              return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+          keys = [
+              "LOGS_DIR",
+              "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
+              "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
+              "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
+              "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
+              "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
+          ]
+          for k in keys:
+              v = os.environ.get(k, "")
+              print(f"{k}: len={len(v)} sha256_12={short_hash(v) if v else 'EMPTY'} startswith_/={v.startswith('/') if v else False}")
+
+          print("== secrets present? (length only) ==")
+          for k in ["OPENAI_API_KEY","DROPBOX_REFRESH_TOKEN","DROPBOX_APP_KEY","DROPBOX_APP_SECRET","STATE_PATH"]:
+              v = os.environ.get(k, "")
+              print(f"{k}: len={len(v)}")
           PY
 
       - name: Run pipeline (debug wrapper)
         shell: bash
         env:
-          # Secrets
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           STATE_PATH: ${{ secrets.STATE_PATH }}
 
-          # Repo variables (plain text)
           LOGS_DIR: ${{ vars.LOGS_DIR }}
           STAGE00_IN: ${{ vars.STAGE00_IN }}
           STAGE00_OUT: ${{ vars.STAGE00_OUT }}
@@ -116,7 +139,6 @@ jobs:
           STAGE40_OUT: ${{ vars.STAGE40_OUT }}
           STAGE40_DONE: ${{ vars.STAGE40_DONE }}
 
-          # Controls
           MONTHLY_STAGE: ${{ inputs.monthly_stage }}
           OPENAI_MODEL: gpt-5-mini
           DEPTH: medium
@@ -126,7 +148,6 @@ jobs:
           MAX_FILES_PER_RUN: "200"
           MAX_INPUT_CHARS: "80000"
           PYTHONUNBUFFERED: "1"
-
         run: |
           set -euxo pipefail
           python -V
