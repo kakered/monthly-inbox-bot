@@ -137,7 +137,9 @@ def _handle_stage00(dbx: DropboxIO, store: StateStore, run_id: str, sp, md: File
     size = _copy_file(dbx, src_path, out_path)
     store.log(run_id=run_id, stage=stage, event="write", src_path=src_path, dst_path=out_path, filename=filename, size=size)
 
-    dbx.move(src_path, done_path, overwrite=True)
+    # IMPORTANT: DropboxIO.move() does NOT accept overwrite= as keyword in your current implementation.
+    # Use positional third argument for overwrite (True).
+    dbx.move(src_path, done_path, True)
     store.log(run_id=run_id, stage=stage, event="move", src_path=src_path, dst_path=done_path, filename=filename)
 
     next_in = sp[stage].get("NEXT_IN") or ""
@@ -174,7 +176,7 @@ def _handle_stage10(dbx: DropboxIO, store: StateStore, run_id: str, sp, md: File
     store.log(run_id=run_id, stage=stage, event="write", src_path=src_path, dst_path=out_per, filename=per_person_name, size=len(per_person_bytes))
 
     done_path = _join(sp[stage]["DONE"], filename)
-    dbx.move(src_path, done_path, overwrite=True)
+    dbx.move(src_path, done_path, True)
     store.log(run_id=run_id, stage=stage, event="move", src_path=src_path, dst_path=done_path, filename=filename)
 
     next_in = sp[stage].get("NEXT_IN") or ""
@@ -199,7 +201,7 @@ def _handle_copy_only(stage: str, dbx: DropboxIO, store: StateStore, run_id: str
     size = _copy_file(dbx, src_path, out_path)
     store.log(run_id=run_id, stage=stage, event="write", src_path=src_path, dst_path=out_path, filename=filename, size=size)
 
-    dbx.move(src_path, done_path, overwrite=True)
+    dbx.move(src_path, done_path, True)
     store.log(run_id=run_id, stage=stage, event="move", src_path=src_path, dst_path=done_path, filename=filename)
 
     next_in = sp[stage].get("NEXT_IN") or ""

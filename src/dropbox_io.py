@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 dropbox_io.py
-Dropbox SDK thin wrapper:
-- list_folder
-- download_to_bytes
-- write_file_bytes
-- move
+Thin wrapper around Dropbox SDK for:
 - ensure_folder
+- list_folder
+- download/upload
+- move (overwrite-safe)
 """
 
 from __future__ import annotations
@@ -14,11 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
-from typing import List
+from typing import Optional
 
 import dropbox
 from dropbox.exceptions import ApiError
-from dropbox.files import WriteMode, FolderMetadata, Metadata
+from dropbox.files import WriteMode, FolderMetadata
 
 
 def _norm(p: str) -> str:
@@ -30,6 +29,15 @@ def _norm(p: str) -> str:
     return p
 
 
+def _parent_dir(path: str) -> str:
+    path = _norm(path)
+    if path == "/":
+        return "/"
+    if path.count("/") < 2:
+        return "/"
+    return "/" + "/".join(path.split("/")[:-1])
+
+
 @dataclass
 class DropboxIO:
     dbx: dropbox.Dropbox
@@ -39,14 +47,14 @@ class DropboxIO:
         rt = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
         app_key = os.getenv("DROPBOX_APP_KEY", "").strip()
         app_secret = os.getenv("DROPBOX_APP_SECRET", "").strip()
+
         if rt and app_key and app_secret:
-            return DropboxIO(
-                dbx=dropbox.Dropbox(
-                    oauth2_refresh_token=rt,
-                    app_key=app_key,
-                    app_secret=app_secret,
-                )
+            dbx = dropbox.Dropbox(
+                oauth2_refresh_token=rt,
+                app_key=app_key,
+                app_secret=app_secret,
             )
+            return DropboxIO(dbx=dbx)
 
         at = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
         if at:
@@ -65,16 +73,16 @@ class DropboxIO:
         try:
             self.dbx.files_create_folder_v2(path)
         except ApiError:
-            # exists is OK
+            # already exists -> ok
             try:
                 md = self.dbx.files_get_metadata(path)
                 if isinstance(md, FolderMetadata):
                     return
             except Exception:
                 pass
-            return
+            raise
 
-    def list_folder(self, path: str) -> List[Metadata]:
+    def list_folder(self, path: str) -> list[dropbox.files.Metadata]:
         path = _norm(path)
         res = self.dbx.files_list_folder(path)
         entries = list(res.entries)
@@ -85,13 +93,12 @@ class DropboxIO:
 
     def download_to_bytes(self, path: str) -> bytes:
         path = _norm(path)
-        _, resp = self.dbx.files_download(path)
+        _md, resp = self.dbx.files_download(path)
         return resp.content
 
     def write_file_bytes(self, path: str, data: bytes, overwrite: bool = True) -> None:
         path = _norm(path)
-        parent = "/" + "/".join(path.split("/")[:-1]) if path.count("/") >= 2 else "/"
-        self.ensure_folder(parent)
+        self.ensure_folder(_parent_dir(path))
 
         mode = WriteMode.overwrite if overwrite else WriteMode.add
         for i in range(3):
@@ -103,9 +110,54 @@ class DropboxIO:
                     raise
                 time.sleep(0.8 * (i + 1))
 
-    def move(self, src: str, dst: str) -> None:
+    def delete_if_exists(self, path: str) -> None:
+        """Delete file/folder if exists. Ignore 'not found'."""
+        path = _norm(path)
+        try:
+            self.dbx.files_delete_v2(path)
+        except ApiError as e:
+            # 'not found' is ok; any other error should surface
+            # Dropbox SDK error typing is a bit verbose; safest is string fallback
+            msg = repr(e)
+            if ("not_found" in msg) or ("path_lookup" in msg and "not_found" in msg):
+                return
+            # Some SDKs represent not-found differently
+            if "LookupError" in msg and "not_found" in msg:
+                return
+            raise
+
+    def move(self, src: str, dst: str, overwrite: bool = True, **_ignored) -> None:
+        """
+        Move src -> dst.
+
+        Compatibility:
+        - Accepts overwrite= as keyword (some callers pass it).
+        - Some older DropboxIO.move implementations did NOT accept overwrite keyword;
+          this signature prevents crashing.
+
+        Behavior:
+        - If overwrite=True, delete dst first (best-effort), then move.
+        - If overwrite=False, move with autorename=True to avoid collisions.
+        """
         src = _norm(src)
         dst = _norm(dst)
-        parent = "/" + "/".join(dst.split("/")[:-1]) if dst.count("/") >= 2 else "/"
-        self.ensure_folder(parent)
-        self.dbx.files_move_v2(src, dst, autorename=False, allow_shared_folder=True)
+        self.ensure_folder(_parent_dir(dst))
+
+        if overwrite:
+            # emulate overwrite by removing destination first
+            self.delete_if_exists(dst)
+            self.dbx.files_move_v2(
+                src,
+                dst,
+                autorename=False,
+                allow_shared_folder=True,
+                allow_ownership_transfer=False,
+            )
+        else:
+            self.dbx.files_move_v2(
+                src,
+                dst,
+                autorename=True,
+                allow_shared_folder=True,
+                allow_ownership_transfer=False,
+            )
