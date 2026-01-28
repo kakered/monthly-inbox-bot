@@ -97,6 +97,39 @@ jobs:
           python -m compileall -q src
           python -c "import src.monthly_main; print('import ok')"
 
+      # ---- Dropbox debug: list stage00 IN to confirm files are actually visible ----
+      - name: Dropbox list debug (stage00 IN)
+        shell: bash
+        env:
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          STAGE00_IN: ${{ vars.STAGE00_IN }}
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os
+          import dropbox
+
+          tok = os.environ["DROPBOX_REFRESH_TOKEN"]
+          app_key = os.environ["DROPBOX_APP_KEY"]
+          app_secret = os.environ["DROPBOX_APP_SECRET"]
+          path = os.environ["STAGE00_IN"]
+
+          dbx = dropbox.Dropbox(
+              oauth2_refresh_token=tok,
+              app_key=app_key,
+              app_secret=app_secret,
+          )
+
+          print("== list_folder:", path)
+          res = dbx.files_list_folder(path)
+          entries = res.entries
+          print("count:", len(entries))
+          for e in entries[:50]:
+              print(type(e).__name__, getattr(e, "path_display", ""), getattr(e, "size", ""))
+          PY
+
       - name: Run pipeline (debug wrapper)
         shell: bash
         env:
