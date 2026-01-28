@@ -1,4 +1,4 @@
-　# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 monthly_main.py
 GitHub Actions から呼ばれる entry point.
