@@ -1,125 +1,47 @@
 # -*- coding: utf-8 -*-
 """
 state_store.py
-State + audit collector (single source of truth).
+Dropbox 上の /_system/state.json 用の最小 state 管理。
 
-- state.json: processed / done / errors
-- audit JSONL: 1 run = 1 file, 1 event = 1 line
+目的:
+- 同じファイルを何度も処理しない（stage単位の processed）
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any, Dict
 import json
-import time
-from typing import Any, Optional
-
-from .dropbox_io import DropboxIO
-
-
-def now_iso_utc() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def stable_key(path: str, content_hash: str | None = None) -> str:
-    return f"{path}|{content_hash}" if content_hash else path
-
-
-def _clip(s: str, n: int = 2000) -> str:
-    if not s:
-        return s
-    return s if len(s) <= n else s[:n] + "...(truncated)"
 
 
 @dataclass
 class StateStore:
-    path: str
-    data: dict[str, Any] = field(default_factory=dict)
-    _audit: list[dict[str, Any]] = field(default_factory=list)
-
-    @staticmethod
-    def _empty() -> dict[str, Any]:
-        return {"done": [], "errors": [], "processed": {}}
+    data: Dict[str, Any]
 
     @classmethod
-    def load(cls, dbx: DropboxIO, path: str) -> "StateStore":
+    def default(cls) -> "StateStore":
+        return cls({"processed": {}})
+
+    @classmethod
+    def load(cls, dbx: Any, path: str) -> "StateStore":
         try:
-            b = dbx.download_to_bytes(path)
-            d = json.loads(b.decode("utf-8"))
-            base = cls._empty()
-            if isinstance(d, dict):
-                base.update(d)
-            base.setdefault("done", [])
-            base.setdefault("errors", [])
-            base.setdefault("processed", {})
-            return cls(path=path, data=base)
+            raw = dbx.download_to_bytes(path)
+            return cls(json.loads(raw.decode("utf-8")))
         except Exception:
-            return cls(path=path, data=cls._empty())
+            return cls.default()
 
-    def save(self, dbx: DropboxIO) -> None:
-        out = json.dumps(self.data, ensure_ascii=False, indent=2).encode("utf-8")
-        dbx.write_file_bytes(self.path, out, overwrite=True)
+    def save(self, dbx: Any, path: str) -> None:
+        b = (json.dumps(self.data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        dbx.write_file_bytes(path, b, overwrite=True)
 
-    def is_processed(self, key: str) -> bool:
-        return key in self.data.get("processed", {})
+    def _proc(self) -> Dict[str, Dict[str, bool]]:
+        self.data.setdefault("processed", {})
+        return self.data["processed"]
 
-    def mark_processed(self, key: str, value: str) -> None:
-        self.data.setdefault("processed", {})[key] = value
+    def is_processed(self, stage: str, src_path: str) -> bool:
+        return bool(self._proc().get(stage, {}).get(src_path))
 
-    def add_done(self, src_path: str) -> None:
-        self.data.setdefault("done", []).append(src_path)
-
-    def add_error(self, item: dict[str, Any]) -> None:
-        self.data.setdefault("errors", []).append(item)
-
-    def audit_event(
-        self,
-        *,
-        run_id: str,
-        stage: str,
-        event: str,
-        src_path: Optional[str] = None,
-        dst_path: Optional[str] = None,
-        filename: Optional[str] = None,
-        message: Optional[str] = None,
-        traceback: Optional[str] = None,
-        **extra: Any,
-    ) -> None:
-        rec: dict[str, Any] = {
-            "timestamp": now_iso_utc(),
-            "run_id": run_id,
-            "stage": stage,
-            "event": event,
-        }
-        if src_path is not None:
-            rec["src_path"] = src_path
-        if dst_path is not None:
-            rec["dst_path"] = dst_path
-        if filename is not None:
-            rec["filename"] = filename
-        if message is not None:
-            rec["message"] = message
-        if traceback:
-            rec["traceback"] = _clip(traceback)
-        if extra:
-            rec.update(extra)
-        self._audit.append(rec)
-
-    def flush_audit_jsonl(self, dbx: DropboxIO, logs_dir: str, run_id: str) -> str:
-        out_path = f"{logs_dir.rstrip('/')}/monthly_audit_{run_id}.jsonl"
-        try:
-            lines = [json.dumps(e, ensure_ascii=False) for e in self._audit]
-            body = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
-            dbx.write_file_bytes(out_path, body, overwrite=True)
-        except Exception as e:
-            # best effort: append failure info in-memory
-            self._audit.append(
-                {
-                    "timestamp": now_iso_utc(),
-                    "run_id": run_id,
-                    "stage": "--",
-                    "event": "error",
-                    "message": f"audit_flush_failed: {e}",
-                }
-            )
-        return out_path
+    def mark_processed(self, stage: str, src_path: str) -> None:
+        p = self._proc()
+        p.setdefault(stage, {})
+        p[stage][src_path] = True
