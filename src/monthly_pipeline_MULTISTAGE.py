@@ -2,16 +2,17 @@
 """
 monthly_pipeline_MULTISTAGE.py
 
-Stage00 + Stage10 + Stage20 (COPY-ONLY) pipeline.
-
-- Robust against cfg shape mismatch (env-first resolution)
-- COPY first, EDIT later (edit hook can be added per stage)
-- Writes audit JSONL to Dropbox via StateStore.flush_audit_jsonl()
+Stage00 + Stage10 + Stage20 + Stage30 + Stage40 (COPY-ONLY) pipeline.
 
 Flow:
 00: 00/IN -> 00/OUT -> 00/DONE -> 10/IN
 10: 10/IN -> 10/OUT -> 10/DONE -> 20/IN
 20: 20/IN -> 20/OUT -> 20/DONE -> 30/IN
+30: 30/IN -> 30/OUT -> 30/DONE -> 40/IN
+40: 40/IN -> 40/OUT -> 40/DONE (end)
+
+- env-first resolution (no cfg shape dependency)
+- audit JSONL always written
 """
 
 from __future__ import annotations
@@ -56,6 +57,68 @@ def _list_files(dbx: DropboxIO, path: str):
     return [e for e in entries if isinstance(e, FileMetadata)]
 
 
+def _copy_stage(
+    *,
+    dbx: DropboxIO,
+    store: StateStore,
+    rid: str,
+    stage: str,
+    in_path: str,
+    out_path: str,
+    done_path: str,
+    next_stage: str | None = None,
+    next_in_path: str | None = None,
+    max_files: int = 200,
+) -> None:
+    files = _list_files(dbx, in_path)
+    store.audit_event(run_id=rid, stage=stage, event="list", src_path=in_path, count=len(files))
+
+    cnt = 0
+    for f in files:
+        if cnt >= max_files:
+            store.audit_event(run_id=rid, stage=stage, event="stop", message="max_files_per_run", limit=max_files)
+            break
+
+        src = f.path_display or f.path_lower or ""
+        if not src:
+            continue
+        base = src.split("/")[-1]
+        key = stable_key(src)
+
+        if store.is_processed(key):
+            store.audit_event(run_id=rid, stage=stage, event="skip", src_path=src, filename=base, message="already_processed")
+            continue
+
+        b = dbx.download_to_bytes(src)
+
+        outp = f"{out_path.rstrip('/')}/{base}"
+        donep = f"{done_path.rstrip('/')}/{base}"
+
+        dbx.write_file_bytes(outp, b, overwrite=True)
+        store.audit_event(run_id=rid, stage=stage, event="write", src_path=src, dst_path=outp, filename=base, size=len(b))
+
+        dbx.move(src, donep)
+        store.audit_event(run_id=rid, stage=stage, event="move", src_path=src, dst_path=donep, filename=base)
+
+        if next_stage and next_in_path:
+            nextp = f"{next_in_path.rstrip('/')}/{base}"
+            dbx.write_file_bytes(nextp, b, overwrite=True)
+            store.audit_event(
+                run_id=rid,
+                stage=next_stage,
+                event="write",
+                src_path=donep,
+                dst_path=nextp,
+                filename=base,
+                message=f"forward to stage{next_stage} IN",
+                size=len(b),
+            )
+
+        store.mark_processed(key, f"stage{stage}:{rid}")
+        cnt += 1
+        print(f"[MONTHLY] stage{stage}: {base} -> OUT/DONE" + (f" + next stage {next_stage} IN" if next_stage else ""))
+
+
 def run_multistage(dbx: DropboxIO, cfg, run_id: str | None = None) -> int:
     rid = run_id or _run_id_default()
 
@@ -76,153 +139,60 @@ def run_multistage(dbx: DropboxIO, cfg, run_id: str | None = None) -> int:
     s20_done = _pick(cfg, "stage20_done", "STAGE20_DONE", "/20_overview_api/DONE")
 
     s30_in   = _pick(cfg, "stage30_in",   "STAGE30_IN",   "/30_personalize_py/IN")
+    s30_out  = _pick(cfg, "stage30_out",  "STAGE30_OUT",  "/30_personalize_py/OUT")
+    s30_done = _pick(cfg, "stage30_done", "STAGE30_DONE", "/30_personalize_py/DONE")
+
+    s40_in   = _pick(cfg, "stage40_in",   "STAGE40_IN",   "/40_trends_api/IN")
+    s40_out  = _pick(cfg, "stage40_out",  "STAGE40_OUT",  "/40_trends_api/OUT")
+    s40_done = _pick(cfg, "stage40_done", "STAGE40_DONE", "/40_trends_api/DONE")
 
     max_files = _pick_int(cfg, "max_files_per_run", "MAX_FILES_PER_RUN", 200)
 
     store = StateStore.load(dbx, state_path)
+    store.audit_event(run_id=rid, stage="--", event="run_start",
+                      message="monthly pipeline start (stage00+10+20+30+40 copy-only)")
 
-    # ---- run start ----
-    store.audit_event(
-        run_id=rid,
-        stage="--",
-        event="run_start",
-        message="monthly pipeline start (stage00+10+20 copy-only)",
-    )
-
-    # ======================
-    # Stage 00 (COPY)
-    # ======================
+    # stage00 -> 10
     try:
-        files00 = _list_files(dbx, s00_in)
-        store.audit_event(run_id=rid, stage="00", event="list", src_path=s00_in, count=len(files00))
-        cnt = 0
-        for f in files00:
-            if cnt >= max_files:
-                store.audit_event(run_id=rid, stage="00", event="stop", message="max_files_per_run", limit=max_files)
-                break
-
-            src = f.path_display or f.path_lower or ""
-            if not src:
-                continue
-            base = src.split("/")[-1]
-            key = stable_key(src)
-
-            if store.is_processed(key):
-                store.audit_event(run_id=rid, stage="00", event="skip", src_path=src, filename=base, message="already_processed")
-                continue
-
-            b = dbx.download_to_bytes(src)
-            outp  = f"{s00_out.rstrip('/')}/{base}"
-            donep = f"{s00_done.rstrip('/')}/{base}"
-            nextp = f"{s10_in.rstrip('/')}/{base}"
-
-            dbx.write_file_bytes(outp, b, overwrite=True)
-            store.audit_event(run_id=rid, stage="00", event="write", src_path=src, dst_path=outp, filename=base, size=len(b))
-
-            dbx.move(src, donep)
-            store.audit_event(run_id=rid, stage="00", event="move", src_path=src, dst_path=donep, filename=base)
-
-            dbx.write_file_bytes(nextp, b, overwrite=True)
-            store.audit_event(run_id=rid, stage="10", event="write", src_path=donep, dst_path=nextp, filename=base,
-                              message="forward to stage10 IN", size=len(b))
-
-            store.add_done(src)
-            store.mark_processed(key, f"stage00:{rid}")
-            cnt += 1
-            print(f"[MONTHLY] stage00: {base} -> OUT/DONE + next stage 10 IN")
-
+        _copy_stage(dbx=dbx, store=store, rid=rid, stage="00",
+                    in_path=s00_in, out_path=s00_out, done_path=s00_done,
+                    next_stage="10", next_in_path=s10_in, max_files=max_files)
     except Exception as e:
         store.audit_event(run_id=rid, stage="00", event="error", message=str(e), traceback=tb.format_exc())
 
-    # ======================
-    # Stage 10 (COPY ONLY)
-    # ======================
+    # stage10 -> 20
     try:
-        files10 = _list_files(dbx, s10_in)
-        store.audit_event(run_id=rid, stage="10", event="list", src_path=s10_in, count=len(files10))
-        cnt = 0
-        for f in files10:
-            if cnt >= max_files:
-                store.audit_event(run_id=rid, stage="10", event="stop", message="max_files_per_run", limit=max_files)
-                break
-
-            src = f.path_display or f.path_lower or ""
-            if not src:
-                continue
-            base = src.split("/")[-1]
-            key = stable_key(src)
-
-            if store.is_processed(key):
-                store.audit_event(run_id=rid, stage="10", event="skip", src_path=src, filename=base, message="already_processed")
-                continue
-
-            b = dbx.download_to_bytes(src)
-            outp  = f"{s10_out.rstrip('/')}/{base}"
-            donep = f"{s10_done.rstrip('/')}/{base}"
-            nextp = f"{s20_in.rstrip('/')}/{base}"
-
-            dbx.write_file_bytes(outp, b, overwrite=True)
-            store.audit_event(run_id=rid, stage="10", event="write", src_path=src, dst_path=outp, filename=base, size=len(b))
-
-            dbx.move(src, donep)
-            store.audit_event(run_id=rid, stage="10", event="move", src_path=src, dst_path=donep, filename=base)
-
-            dbx.write_file_bytes(nextp, b, overwrite=True)
-            store.audit_event(run_id=rid, stage="20", event="write", src_path=donep, dst_path=nextp, filename=base,
-                              message="forward to stage20 IN", size=len(b))
-
-            store.mark_processed(key, f"stage10:{rid}")
-            cnt += 1
-            print(f"[MONTHLY] stage10: {base} -> OUT/DONE + next stage 20 IN")
-
+        _copy_stage(dbx=dbx, store=store, rid=rid, stage="10",
+                    in_path=s10_in, out_path=s10_out, done_path=s10_done,
+                    next_stage="20", next_in_path=s20_in, max_files=max_files)
     except Exception as e:
         store.audit_event(run_id=rid, stage="10", event="error", message=str(e), traceback=tb.format_exc())
 
-    # ======================
-    # Stage 20 (COPY ONLY)
-    # ======================
+    # stage20 -> 30
     try:
-        files20 = _list_files(dbx, s20_in)
-        store.audit_event(run_id=rid, stage="20", event="list", src_path=s20_in, count=len(files20))
-        cnt = 0
-        for f in files20:
-            if cnt >= max_files:
-                store.audit_event(run_id=rid, stage="20", event="stop", message="max_files_per_run", limit=max_files)
-                break
-
-            src = f.path_display or f.path_lower or ""
-            if not src:
-                continue
-            base = src.split("/")[-1]
-            key = stable_key(src)
-
-            if store.is_processed(key):
-                store.audit_event(run_id=rid, stage="20", event="skip", src_path=src, filename=base, message="already_processed")
-                continue
-
-            b = dbx.download_to_bytes(src)
-            outp  = f"{s20_out.rstrip('/')}/{base}"
-            donep = f"{s20_done.rstrip('/')}/{base}"
-            nextp = f"{s30_in.rstrip('/')}/{base}"
-
-            dbx.write_file_bytes(outp, b, overwrite=True)
-            store.audit_event(run_id=rid, stage="20", event="write", src_path=src, dst_path=outp, filename=base, size=len(b))
-
-            dbx.move(src, donep)
-            store.audit_event(run_id=rid, stage="20", event="move", src_path=src, dst_path=donep, filename=base)
-
-            dbx.write_file_bytes(nextp, b, overwrite=True)
-            store.audit_event(run_id=rid, stage="30", event="write", src_path=donep, dst_path=nextp, filename=base,
-                              message="forward to stage30 IN", size=len(b))
-
-            store.mark_processed(key, f"stage20:{rid}")
-            cnt += 1
-            print(f"[MONTHLY] stage20: {base} -> OUT/DONE + next stage 30 IN")
-
+        _copy_stage(dbx=dbx, store=store, rid=rid, stage="20",
+                    in_path=s20_in, out_path=s20_out, done_path=s20_done,
+                    next_stage="30", next_in_path=s30_in, max_files=max_files)
     except Exception as e:
         store.audit_event(run_id=rid, stage="20", event="error", message=str(e), traceback=tb.format_exc())
 
-    # ---- persist ----
+    # stage30 -> 40
+    try:
+        _copy_stage(dbx=dbx, store=store, rid=rid, stage="30",
+                    in_path=s30_in, out_path=s30_out, done_path=s30_done,
+                    next_stage="40", next_in_path=s40_in, max_files=max_files)
+    except Exception as e:
+        store.audit_event(run_id=rid, stage="30", event="error", message=str(e), traceback=tb.format_exc())
+
+    # stage40 -> end
+    try:
+        _copy_stage(dbx=dbx, store=store, rid=rid, stage="40",
+                    in_path=s40_in, out_path=s40_out, done_path=s40_done,
+                    next_stage=None, next_in_path=None, max_files=max_files)
+    except Exception as e:
+        store.audit_event(run_id=rid, stage="40", event="error", message=str(e), traceback=tb.format_exc())
+
+    # persist
     try:
         store.save(dbx)
         store.audit_event(run_id=rid, stage="--", event="write_state", filename=state_path, message="state saved")
