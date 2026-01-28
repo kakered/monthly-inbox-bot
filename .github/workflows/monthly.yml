@@ -88,71 +88,95 @@ jobs:
               print(f"{k}: len={len(v)}")
           PY
 
-      # ---- Dropbox diagnostics: identify what this token can actually see ----
-      - name: Dropbox diagnostics (account + root + stage00 IN)
+      # ---- Dropbox debug: list IN/OUT/DONE + check state.json existence ----
+      - name: Dropbox debug (IN/OUT/DONE + state.json)
         shell: bash
         env:
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          STATE_PATH: ${{ secrets.STATE_PATH }}
           STAGE00_IN: ${{ vars.STAGE00_IN }}
+          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
+          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
         run: |
           set -euxo pipefail
           python - <<'PY'
-          import os
+          import os, json, hashlib
           import dropbox
+          from dropbox.exceptions import ApiError
 
           tok = os.environ["DROPBOX_REFRESH_TOKEN"]
           app_key = os.environ["DROPBOX_APP_KEY"]
           app_secret = os.environ["DROPBOX_APP_SECRET"]
-          stage00_in = os.environ["STAGE00_IN"]
+          state_path = os.environ.get("STATE_PATH","")
+          p_in = os.environ["STAGE00_IN"]
+          p_out = os.environ["STAGE00_OUT"]
+          p_done = os.environ["STAGE00_DONE"]
 
-          dbx = dropbox.Dropbox(
-              oauth2_refresh_token=tok,
-              app_key=app_key,
-              app_secret=app_secret,
-          )
+          def short_hash(s: str) -> str:
+              return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
-          print("== current_account ==")
-          try:
-              acc = dbx.users_get_current_account()
-              print("account_id:", acc.account_id)
-              print("name:", acc.name.display_name)
-              print("email:", getattr(acc, "email", ""))
-          except Exception as e:
-              print("current_account ERROR:", repr(e))
+          dbx = dropbox.Dropbox(oauth2_refresh_token=tok, app_key=app_key, app_secret=app_secret)
 
-          def safe_list(path: str):
-              print(f"\n== list_folder path={path!r} ==")
+          def list_folder(path: str, limit: int = 50):
+              print(f"\n== list_folder: {path!r} ==")
               try:
                   res = dbx.files_list_folder(path)
-                  entries = res.entries
-                  print("count:", len(entries))
-                  for e in entries[:50]:
-                      print(type(e).__name__, getattr(e, "path_display", ""), getattr(e, "size", ""))
-              except Exception as e:
-                  print("list_folder ERROR:", repr(e))
+              except ApiError as e:
+                  print("ERROR list_folder:", e)
+                  return
+              entries = res.entries
+              print("count:", len(entries))
+              for e in entries[:limit]:
+                  t = type(e).__name__
+                  pd = getattr(e, "path_display", "")
+                  sz = getattr(e, "size", "")
+                  print(t, pd, sz)
 
-          # Dropbox API root is "" (empty string)
-          safe_list("")
-          safe_list(stage00_in)
+          list_folder(p_in)
+          list_folder(p_out)
+          list_folder(p_done)
 
-          # Also list parent folder of STAGE00_IN (if any)
-          parent = stage00_in.rstrip("/")
-          parent = parent[: parent.rfind("/")] if "/" in parent[1:] else ""
-          safe_list(parent)
-
-          # Search a broad query to locate misplaced files (top 20)
-          print("\n== search (broad) query='.xlsx' ==")
+          # Check if the target file exists somewhere (name-based)
+          target = "今月の振り返り１６.xlsx"
+          print(f"\n== search by name: {target} ==")
           try:
-              sr = dbx.files_search_v2(query=".xlsx", options=dropbox.files.SearchOptions(max_results=20))
+              sr = dbx.files_search_v2(query=target)
               matches = sr.matches or []
               print("matches:", len(matches))
-              for m in matches[:20]:
+              for m in matches[:50]:
                   md = m.metadata.get_metadata()
-                  print(getattr(md, "path_display", ""))
-          except Exception as e:
-              print("search ERROR:", repr(e))
+                  print(getattr(md, "path_display",""))
+          except ApiError as e:
+              print("ERROR search:", e)
+
+          # State file existence + minimal schema info (no content dump)
+          print(f"\n== state_path check: len={len(state_path)} sha256_12={short_hash(state_path) if state_path else 'EMPTY'} ==")
+          if not state_path:
+              print("STATE_PATH is EMPTY (this alone can explain 'no progress').")
+          else:
+              try:
+                  md = dbx.files_get_metadata(state_path)
+                  print("state exists:", getattr(md, "path_display",""), "size:", getattr(md, "size",""))
+                  _, resp = dbx.files_download(state_path)
+                  raw = resp.content
+                  print("state download bytes:", len(raw))
+                  try:
+                      obj = json.loads(raw.decode("utf-8"))
+                      if isinstance(obj, dict):
+                          print("state json keys:", sorted(list(obj.keys()))[:50])
+                          # common helpful counts without assuming schema
+                          for k in ["processed","done","files","history","items"]:
+                              if k in obj and isinstance(obj[k], (list, dict)):
+                                  print(f"state[{k}] type={type(obj[k]).__name__} len={len(obj[k])}")
+                      else:
+                          print("state json is not dict:", type(obj).__name__)
+                  except Exception as e:
+                      print("state json parse error:", repr(e))
+              except ApiError as e:
+                  # Not found or permissions
+                  print("state metadata error:", e)
           PY
 
       # ---- Preflight: fail fast before touching pipeline logic ----
