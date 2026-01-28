@@ -3,19 +3,8 @@
 state_store.py
 State + audit collector (single source of truth).
 
-State is stored as JSON on Dropbox (STATE_PATH).
-Audit is stored as JSONL on Dropbox (LOGS_DIR), 1 run = 1 file.
-
-AUDIT SCHEMA (1 line = 1 event)
-- timestamp: ISO8601 UTC (e.g., 2026-01-27T12:34:56Z)
-- run_id: GitHub Actions run unit (e.g., gh-<RUN_ID>-<ATTEMPT>)
-- stage: "00" / "10" / "20" / "30" / "40" or "--"
-- event: list / move / write_state / error / run_start / run_end / write / skip / stop
-- src_path, dst_path, filename (optional)
-- message (optional)
-
-NOTE
-- Audit is best-effort and should not crash the pipeline.
+- state.json: processed / done / errors
+- audit JSONL: 1 run = 1 file, 1 event = 1 line
 """
 
 from __future__ import annotations
@@ -33,9 +22,13 @@ def now_iso_utc() -> str:
 
 
 def stable_key(path: str, content_hash: str | None = None) -> str:
-    if content_hash:
-        return f"{path}|sha256:{content_hash}"
-    return path
+    return f"{path}|{content_hash}" if content_hash else path
+
+
+def _clip(s: str, n: int = 2000) -> str:
+    if not s:
+        return s
+    return s if len(s) <= n else s[:n] + "...(truncated)"
 
 
 @dataclass
@@ -56,12 +49,9 @@ class StateStore:
             base = cls._empty()
             if isinstance(d, dict):
                 base.update(d)
-            if not isinstance(base.get("done"), list):
-                base["done"] = []
-            if not isinstance(base.get("errors"), list):
-                base["errors"] = []
-            if not isinstance(base.get("processed"), dict):
-                base["processed"] = {}
+            base.setdefault("done", [])
+            base.setdefault("errors", [])
+            base.setdefault("processed", {})
             return cls(path=path, data=base)
         except Exception:
             return cls(path=path, data=cls._empty())
@@ -92,6 +82,7 @@ class StateStore:
         dst_path: Optional[str] = None,
         filename: Optional[str] = None,
         message: Optional[str] = None,
+        traceback: Optional[str] = None,
         **extra: Any,
     ) -> None:
         rec: dict[str, Any] = {
@@ -108,19 +99,20 @@ class StateStore:
             rec["filename"] = filename
         if message is not None:
             rec["message"] = message
+        if traceback:
+            rec["traceback"] = _clip(traceback)
         if extra:
             rec.update(extra)
         self._audit.append(rec)
 
     def flush_audit_jsonl(self, dbx: DropboxIO, logs_dir: str, run_id: str) -> str:
-        # best effort flush: do not raise
         out_path = f"{logs_dir.rstrip('/')}/monthly_audit_{run_id}.jsonl"
         try:
             lines = [json.dumps(e, ensure_ascii=False) for e in self._audit]
             body = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
             dbx.write_file_bytes(out_path, body, overwrite=True)
         except Exception as e:
-            # try to record the failure in-memory (won't be persisted if this also fails)
+            # best effort: append failure info in-memory
             self._audit.append(
                 {
                     "timestamp": now_iso_utc(),
