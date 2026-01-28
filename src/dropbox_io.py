@@ -1,106 +1,145 @@
 # -*- coding: utf-8 -*-
 """
 dropbox_io.py
-Lightweight Dropbox wrapper used by monthly-inbox-bot.
+Dropbox I/O wrapper.
 
-Notes
-- Dropbox SDK v12+ objects (e.g., ListFolderResult) do NOT provide .to_dict().
-- This wrapper returns plain Python types (list/bytes/bool) to keep the rest of
-  the pipeline stable and testable.
+- Dropbox SDK v12 系で ListFolderResult.to_dict() が無い問題に対応
+- move(overwrite=...) の引数を受けて monthly_pipeline から呼べるようにする
+- ensure_folder("/") や "" で malformed_path になるのを回避
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+import os
+from typing import Any, Dict, List, Optional
 
 import dropbox
-from dropbox.files import WriteMode
+from dropbox.exceptions import ApiError
 
-from .utils_dropbox_item import is_file, get_path_lower
+from .utils_dropbox_item import as_min_dict, is_file, is_folder, get_path_lower
 
 
 def _parent_dir(path: str) -> str:
     path = (path or "").rstrip("/")
     if not path or path == "/":
-        return ""
-    parts = path.split("/")
-    if len(parts) <= 2:
-        return ""
-    return "/".join(parts[:-1]) or ""
+        return "/"
+    i = path.rfind("/")
+    if i <= 0:
+        return "/"
+    return path[:i]
 
 
-@dataclass
 class DropboxIO:
-    dbx: dropbox.Dropbox
+    def __init__(self, refresh_token: str, app_key: str, app_secret: str):
+        self.dbx = dropbox.Dropbox(
+            oauth2_refresh_token=refresh_token,
+            app_key=app_key,
+            app_secret=app_secret,
+        )
 
-    # ---------- folder / metadata ----------
+    # ---------- folder helpers ----------
     def ensure_folder(self, path: str) -> None:
         """
-        Create folder if missing.
-        Safe for '', '/'.
+        フォルダが無ければ作る。Dropboxは "/" や "" を create_folder できないので弾く。
         """
+        path = (path or "").strip()
         if not path or path == "/":
             return
+        if not path.startswith("/"):
+            # malformed_path を避ける
+            path = "/" + path
+
         try:
-            self.dbx.files_get_metadata(path)
-            return
-        except dropbox.exceptions.ApiError:
+            self.dbx.files_create_folder_v2(path)
+        except ApiError as e:
+            # already exists は無視
             try:
-                self.dbx.files_create_folder_v2(path)
-            except dropbox.exceptions.ApiError:
-                # If already created by a race, ignore; otherwise re-raise by re-checking
-                self.dbx.files_get_metadata(path)
-                return
+                err = e.error
+                # path/conflict/folder のようなケースをざっくり吸収
+                if "conflict" in str(err).lower():
+                    return
+            except Exception:
+                pass
+            # それ以外は再raise
+            raise
 
-    def exists(self, path: str) -> bool:
-        try:
-            self.dbx.files_get_metadata(path)
-            return True
-        except dropbox.exceptions.ApiError:
-            return False
+    # ---------- list ----------
+    def list_folder(self, path: str) -> Dict[str, Any]:
+        """
+        monthly_pipeline 側が res.get("entries") を期待しているので dict で返す。
+        Dropbox SDK v12 では res.to_dict() が無いので自前で整形する。
+        """
+        if not path.startswith("/"):
+            path = "/" + path
 
-    def list_folder(self, folder_path: str) -> List[dropbox.files.Metadata]:
-        """
-        Returns a list of Dropbox SDK Metadata objects.
-        """
-        res = self.dbx.files_list_folder(folder_path)
-        out: List[dropbox.files.Metadata] = []
-        out.extend(res.entries)
-        while res.has_more:
-            res = self.dbx.files_list_folder_continue(res.cursor)
-            out.extend(res.entries)
+        res = self.dbx.files_list_folder(path)
+        entries = []
+        for it in getattr(res, "entries", []) or []:
+            entries.append(as_min_dict(it))
+
+        out = {
+            "entries": entries,
+            "cursor": getattr(res, "cursor", None),
+            "has_more": bool(getattr(res, "has_more", False)),
+        }
         return out
 
-    def list_folder_files(self, folder_path: str) -> List[str]:
-        """
-        Convenience: returns lower paths for file entries only.
-        """
-        items = self.list_folder(folder_path)
-        return [get_path_lower(x) for x in items if is_file(x)]
-
-    # ---------- data I/O ----------
+    # ---------- read/write ----------
     def read_file_bytes(self, path: str) -> bytes:
-        _md, resp = self.dbx.files_download(path)
+        if not path.startswith("/"):
+            path = "/" + path
+        md, resp = self.dbx.files_download(path)
         return resp.content
 
     def write_file_bytes(self, path: str, data: bytes, overwrite: bool = True) -> None:
-        parent = _parent_dir(path)
-        if parent:
-            self.ensure_folder(parent)
-        mode = WriteMode.overwrite if overwrite else WriteMode.add
-        self.dbx.files_upload(data, path, mode=mode)
+        if not path.startswith("/"):
+            path = "/" + path
 
-    # ---------- delete / move ----------
+        self.ensure_folder(_parent_dir(path))
+
+        mode = dropbox.files.WriteMode.overwrite if overwrite else dropbox.files.WriteMode.add
+        self.dbx.files_upload(data, path, mode=mode, mute=True)
+
+    # ---------- move/copy ----------
     def delete(self, path: str) -> None:
+        if not path.startswith("/"):
+            path = "/" + path
         try:
             self.dbx.files_delete_v2(path)
-        except dropbox.exceptions.ApiError:
-            pass
+        except ApiError as e:
+            # not_found は無視
+            if "not_found" in str(e).lower():
+                return
+            raise
 
-    def move(self, src_path: str, dst_path: str, overwrite: bool = True) -> None:
+    def move(self, src_path: str, dst_path: str, overwrite: bool = False) -> None:
         """
-        Dropbox move has no 'overwrite' flag; implement overwrite by deleting destination first.
+        monthly_pipeline から overwrite=... で呼ばれても落ちないようにする。
+        Dropbox API は overwrite という引数を持たないので、
+        overwrite=True の場合は dst を消してから move する。
         """
-        if overwrite and self.exists(dst_path):
+        if not src_path.startswith("/"):
+            src_path = "/" + src_path
+        if not dst_path.startswith("/"):
+            dst_path = "/" + dst_path
+
+        self.ensure_folder(_parent_dir(dst_path))
+
+        if overwrite:
             self.delete(dst_path)
-        self.dbx.files_move_v2(src_path, dst_path, autorename=False, allow_shared_folder=True)
+
+        # autorename=False で「同名があればエラー」にして挙動を明確化
+        self.dbx.files_move_v2(src_path, dst_path, autorename=False)
+
+    def copy(self, src_path: str, dst_path: str, overwrite: bool = False) -> None:
+        if not src_path.startswith("/"):
+            src_path = "/" + src_path
+        if not dst_path.startswith("/"):
+            dst_path = "/" + dst_path
+
+        self.ensure_folder(_parent_dir(dst_path))
+
+        if overwrite:
+            self.delete(dst_path)
+
+        self.dbx.files_copy_v2(src_path, dst_path, autorename=False)
