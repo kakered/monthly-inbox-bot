@@ -2,9 +2,10 @@
 """
 monthly_pipeline_MULTISTAGE.py
 
-Stage00 + Stage10 + Stage20 + Stage30 + Stage40 (COPY-ONLY) pipeline.
+COPY-ONLY pipeline with audit JSONL.
+IMPORTANT: Only ONE stage is processed per run, controlled by env MONTHLY_STAGE (00/10/20/30/40).
 
-Flow:
+Flow (each run processes one stage and forwards to next stage IN, but does NOT process next stage):
 00: 00/IN -> 00/OUT -> 00/DONE -> 10/IN
 10: 10/IN -> 10/OUT -> 10/DONE -> 20/IN
 20: 20/IN -> 20/OUT -> 20/DONE -> 30/IN
@@ -55,6 +56,22 @@ def _pick_int(cfg, attr: str, env_name: str, default: int) -> int:
 def _list_files(dbx: DropboxIO, path: str):
     entries = dbx.list_folder(path)
     return [e for e in entries if isinstance(e, FileMetadata)]
+
+
+def _normalize_stage(s: str) -> str:
+    s = (s or "").strip()
+    if s in {"0", "00"}:
+        return "00"
+    if s in {"10"}:
+        return "10"
+    if s in {"20"}:
+        return "20"
+    if s in {"30"}:
+        return "30"
+    if s in {"40"}:
+        return "40"
+    # fallback
+    return "00"
 
 
 def _copy_stage(
@@ -148,49 +165,52 @@ def run_multistage(dbx: DropboxIO, cfg, run_id: str | None = None) -> int:
 
     max_files = _pick_int(cfg, "max_files_per_run", "MAX_FILES_PER_RUN", 200)
 
+    # ---- stage gate ----
+    stage_gate = _normalize_stage(os.getenv("MONTHLY_STAGE", "00"))
+
     store = StateStore.load(dbx, state_path)
-    store.audit_event(run_id=rid, stage="--", event="run_start",
-                      message="monthly pipeline start (stage00+10+20+30+40 copy-only)")
+    store.audit_event(
+        run_id=rid,
+        stage="--",
+        event="run_start",
+        message=f"monthly pipeline start (copy-only; one-stage-per-run; gate={stage_gate})",
+    )
 
-    # stage00 -> 10
     try:
-        _copy_stage(dbx=dbx, store=store, rid=rid, stage="00",
-                    in_path=s00_in, out_path=s00_out, done_path=s00_done,
-                    next_stage="10", next_in_path=s10_in, max_files=max_files)
+        if stage_gate == "00":
+            _copy_stage(
+                dbx=dbx, store=store, rid=rid, stage="00",
+                in_path=s00_in, out_path=s00_out, done_path=s00_done,
+                next_stage="10", next_in_path=s10_in, max_files=max_files,
+            )
+        elif stage_gate == "10":
+            _copy_stage(
+                dbx=dbx, store=store, rid=rid, stage="10",
+                in_path=s10_in, out_path=s10_out, done_path=s10_done,
+                next_stage="20", next_in_path=s20_in, max_files=max_files,
+            )
+        elif stage_gate == "20":
+            _copy_stage(
+                dbx=dbx, store=store, rid=rid, stage="20",
+                in_path=s20_in, out_path=s20_out, done_path=s20_done,
+                next_stage="30", next_in_path=s30_in, max_files=max_files,
+            )
+        elif stage_gate == "30":
+            _copy_stage(
+                dbx=dbx, store=store, rid=rid, stage="30",
+                in_path=s30_in, out_path=s30_out, done_path=s30_done,
+                next_stage="40", next_in_path=s40_in, max_files=max_files,
+            )
+        elif stage_gate == "40":
+            _copy_stage(
+                dbx=dbx, store=store, rid=rid, stage="40",
+                in_path=s40_in, out_path=s40_out, done_path=s40_done,
+                next_stage=None, next_in_path=None, max_files=max_files,
+            )
+        else:
+            store.audit_event(run_id=rid, stage="--", event="error", message=f"invalid MONTHLY_STAGE={stage_gate!r}")
     except Exception as e:
-        store.audit_event(run_id=rid, stage="00", event="error", message=str(e), traceback=tb.format_exc())
-
-    # stage10 -> 20
-    try:
-        _copy_stage(dbx=dbx, store=store, rid=rid, stage="10",
-                    in_path=s10_in, out_path=s10_out, done_path=s10_done,
-                    next_stage="20", next_in_path=s20_in, max_files=max_files)
-    except Exception as e:
-        store.audit_event(run_id=rid, stage="10", event="error", message=str(e), traceback=tb.format_exc())
-
-    # stage20 -> 30
-    try:
-        _copy_stage(dbx=dbx, store=store, rid=rid, stage="20",
-                    in_path=s20_in, out_path=s20_out, done_path=s20_done,
-                    next_stage="30", next_in_path=s30_in, max_files=max_files)
-    except Exception as e:
-        store.audit_event(run_id=rid, stage="20", event="error", message=str(e), traceback=tb.format_exc())
-
-    # stage30 -> 40
-    try:
-        _copy_stage(dbx=dbx, store=store, rid=rid, stage="30",
-                    in_path=s30_in, out_path=s30_out, done_path=s30_done,
-                    next_stage="40", next_in_path=s40_in, max_files=max_files)
-    except Exception as e:
-        store.audit_event(run_id=rid, stage="30", event="error", message=str(e), traceback=tb.format_exc())
-
-    # stage40 -> end
-    try:
-        _copy_stage(dbx=dbx, store=store, rid=rid, stage="40",
-                    in_path=s40_in, out_path=s40_out, done_path=s40_done,
-                    next_stage=None, next_in_path=None, max_files=max_files)
-    except Exception as e:
-        store.audit_event(run_id=rid, stage="40", event="error", message=str(e), traceback=tb.format_exc())
+        store.audit_event(run_id=rid, stage=stage_gate, event="error", message=str(e), traceback=tb.format_exc())
 
     # persist
     try:
