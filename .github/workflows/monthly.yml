@@ -88,8 +88,8 @@ jobs:
               print(f"{k}: len={len(v)}")
           PY
 
-      # ---- Dropbox visibility check: list stage00 IN (this is the key debug) ----
-      - name: Dropbox list debug (stage00 IN)
+      # ---- Dropbox diagnostics: identify what this token can actually see ----
+      - name: Dropbox diagnostics (account + root + stage00 IN)
         shell: bash
         env:
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
@@ -105,7 +105,7 @@ jobs:
           tok = os.environ["DROPBOX_REFRESH_TOKEN"]
           app_key = os.environ["DROPBOX_APP_KEY"]
           app_secret = os.environ["DROPBOX_APP_SECRET"]
-          path = os.environ["STAGE00_IN"]
+          stage00_in = os.environ["STAGE00_IN"]
 
           dbx = dropbox.Dropbox(
               oauth2_refresh_token=tok,
@@ -113,12 +113,46 @@ jobs:
               app_secret=app_secret,
           )
 
-          print("== list_folder:", path)
-          res = dbx.files_list_folder(path)
-          entries = res.entries
-          print("count:", len(entries))
-          for e in entries[:50]:
-              print(type(e).__name__, getattr(e, "path_display", ""), getattr(e, "size", ""))
+          print("== current_account ==")
+          try:
+              acc = dbx.users_get_current_account()
+              print("account_id:", acc.account_id)
+              print("name:", acc.name.display_name)
+              print("email:", getattr(acc, "email", ""))
+          except Exception as e:
+              print("current_account ERROR:", repr(e))
+
+          def safe_list(path: str):
+              print(f"\n== list_folder path={path!r} ==")
+              try:
+                  res = dbx.files_list_folder(path)
+                  entries = res.entries
+                  print("count:", len(entries))
+                  for e in entries[:50]:
+                      print(type(e).__name__, getattr(e, "path_display", ""), getattr(e, "size", ""))
+              except Exception as e:
+                  print("list_folder ERROR:", repr(e))
+
+          # Dropbox API root is "" (empty string)
+          safe_list("")
+          safe_list(stage00_in)
+
+          # Also list parent folder of STAGE00_IN (if any)
+          parent = stage00_in.rstrip("/")
+          parent = parent[: parent.rfind("/")] if "/" in parent[1:] else ""
+          safe_list(parent)
+
+          # Search a broad query to locate misplaced files (top 20)
+          print("\n== search (broad) query='.xlsx' ==")
+          try:
+              sr = dbx.files_search_v2(query=".xlsx", options=dropbox.files.SearchOptions(max_results=20))
+              matches = sr.matches or []
+              print("matches:", len(matches))
+              for m in matches[:20]:
+                  md = m.metadata.get_metadata()
+                  print(getattr(md, "path_display", ""))
+          except Exception as e:
+              print("search ERROR:", repr(e))
           PY
 
       # ---- Preflight: fail fast before touching pipeline logic ----
