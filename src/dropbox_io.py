@@ -1,176 +1,106 @@
 # -*- coding: utf-8 -*-
 """
 dropbox_io.py
-Thin wrapper around Dropbox SDK used by monthly-inbox-bot.
+Lightweight Dropbox wrapper used by monthly-inbox-bot.
 
-Goals:
-- Keep interface stable (list_folder / read_file_bytes / write_file_bytes / move / delete / ensure_folder)
-- Be robust to SDK changes (NO res.to_dict()).
-- Minimal behavior: prefer correctness + clear failures.
+Notes
+- Dropbox SDK v12+ objects (e.g., ListFolderResult) do NOT provide .to_dict().
+- This wrapper returns plain Python types (list/bytes/bool) to keep the rest of
+  the pipeline stable and testable.
 """
-
 from __future__ import annotations
 
-import os
-import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import dropbox
 from dropbox.files import WriteMode
-from dropbox.exceptions import ApiError
 
-
-def _norm_path(path: str) -> str:
-    """
-    Normalize a Dropbox path:
-    - must start with '/'
-    - collapse multiple slashes
-    - strip trailing slash except root
-    """
-    if path is None:
-        return ""
-    p = str(path).strip()
-    if not p:
-        return ""
-    p = p.replace("\\", "/")
-    while "//" in p:
-        p = p.replace("//", "/")
-    if not p.startswith("/"):
-        p = "/" + p
-    if len(p) > 1 and p.endswith("/"):
-        p = p[:-1]
-    return p
+from .utils_dropbox_item import is_file, get_path_lower
 
 
 def _parent_dir(path: str) -> str:
-    p = _norm_path(path)
-    if not p or p == "/":
+    path = (path or "").rstrip("/")
+    if not path or path == "/":
         return ""
-    parent = os.path.dirname(p)
-    if parent in (".", "/"):
-        return "" if parent == "." else "/"
-    return parent
+    parts = path.split("/")
+    if len(parts) <= 2:
+        return ""
+    return "/".join(parts[:-1]) or ""
 
 
 @dataclass
 class DropboxIO:
     dbx: dropbox.Dropbox
 
-    # ---------- folder ops ----------
+    # ---------- folder / metadata ----------
     def ensure_folder(self, path: str) -> None:
         """
-        Ensure a folder exists. Creates parents as needed.
-        Safe for:
-        - '' or '/' (no-op)
-        - already-existing folders
+        Create folder if missing.
+        Safe for '', '/'.
         """
-        p = _norm_path(path)
-        if not p or p == "/":
+        if not path or path == "/":
             return
-
-        parts = [x for x in p.split("/") if x]
-        cur = ""
-        for part in parts:
-            cur = cur + "/" + part
-            try:
-                self.dbx.files_create_folder_v2(cur)
-            except ApiError as e:
-                # already exists or cannot create -> ignore if it's "already exists"
-                # Dropbox SDK doesn't expose a single stable code, so we accept common patterns.
-                msg = repr(e)
-                if ("conflict" in msg and "folder" in msg) or ("already exists" in msg) or ("conflict" in msg):
-                    continue
-                # malformed_path typically happens when cur is invalid; we want to fail loudly then.
-                raise
-
-    # ---------- list/read/write ----------
-    def list_folder(self, path: str) -> List[object]:
-        """
-        Return a list of Metadata objects (FileMetadata/FolderMetadata/DeletedMetadata).
-        Do NOT convert to dict (SDK objects don't guarantee to_dict()).
-        """
-        p = _norm_path(path)
-        if not p:
-            return []
         try:
-            res = self.dbx.files_list_folder(p)
-        except ApiError as e:
-            # if folder doesn't exist, treat as empty
-            msg = repr(e)
-            if "not_found" in msg or "path" in msg and "not_found" in msg:
-                return []
-            raise
+            self.dbx.files_get_metadata(path)
+            return
+        except dropbox.exceptions.ApiError:
+            try:
+                self.dbx.files_create_folder_v2(path)
+            except dropbox.exceptions.ApiError:
+                # If already created by a race, ignore; otherwise re-raise by re-checking
+                self.dbx.files_get_metadata(path)
+                return
 
-        entries = list(res.entries or [])
-        while getattr(res, "has_more", False):
+    def exists(self, path: str) -> bool:
+        try:
+            self.dbx.files_get_metadata(path)
+            return True
+        except dropbox.exceptions.ApiError:
+            return False
+
+    def list_folder(self, folder_path: str) -> List[dropbox.files.Metadata]:
+        """
+        Returns a list of Dropbox SDK Metadata objects.
+        """
+        res = self.dbx.files_list_folder(folder_path)
+        out: List[dropbox.files.Metadata] = []
+        out.extend(res.entries)
+        while res.has_more:
             res = self.dbx.files_list_folder_continue(res.cursor)
-            entries.extend(list(res.entries or []))
-        return entries
+            out.extend(res.entries)
+        return out
 
+    def list_folder_files(self, folder_path: str) -> List[str]:
+        """
+        Convenience: returns lower paths for file entries only.
+        """
+        items = self.list_folder(folder_path)
+        return [get_path_lower(x) for x in items if is_file(x)]
+
+    # ---------- data I/O ----------
     def read_file_bytes(self, path: str) -> bytes:
-        p = _norm_path(path)
-        md, resp = self.dbx.files_download(p)
+        _md, resp = self.dbx.files_download(path)
         return resp.content
 
     def write_file_bytes(self, path: str, data: bytes, overwrite: bool = True) -> None:
-        p = _norm_path(path)
-        parent = _parent_dir(p)
-        if parent and parent != "/":
+        parent = _parent_dir(path)
+        if parent:
             self.ensure_folder(parent)
-
         mode = WriteMode.overwrite if overwrite else WriteMode.add
-        # mute=True avoids creating extra notifications
-        self.dbx.files_upload(data, p, mode=mode, mute=True)
+        self.dbx.files_upload(data, path, mode=mode)
 
-    # ---------- move/delete ----------
+    # ---------- delete / move ----------
     def delete(self, path: str) -> None:
-        p = _norm_path(path)
-        if not p:
-            return
         try:
-            self.dbx.files_delete_v2(p)
-        except ApiError as e:
-            msg = repr(e)
-            if "not_found" in msg:
-                return
-            raise
+            self.dbx.files_delete_v2(path)
+        except dropbox.exceptions.ApiError:
+            pass
 
-    def move(self, src_path: str, dst_path: str, overwrite: bool = False) -> None:
+    def move(self, src_path: str, dst_path: str, overwrite: bool = True) -> None:
         """
-        Move file/folder.
-        If overwrite=True and destination exists, delete destination then move.
+        Dropbox move has no 'overwrite' flag; implement overwrite by deleting destination first.
         """
-        src = _norm_path(src_path)
-        dst = _norm_path(dst_path)
-
-        # ensure destination parent exists
-        parent = _parent_dir(dst)
-        if parent and parent not in ("", "/"):
-            self.ensure_folder(parent)
-
-        if overwrite:
-            # best-effort delete; ignore not_found
-            try:
-                self.delete(dst)
-            except Exception:
-                pass
-
-        # Dropbox move can fail due to transient conflicts; retry a bit
-        for i in range(3):
-            try:
-                self.dbx.files_move_v2(src, dst, autorename=False)
-                return
-            except ApiError as e:
-                # If conflict and overwrite was requested, attempt delete+retry.
-                msg = repr(e)
-                if overwrite and ("conflict" in msg or "already_exists" in msg):
-                    try:
-                        self.delete(dst)
-                    except Exception:
-                        pass
-                    time.sleep(0.2 * (i + 1))
-                    continue
-                raise
-        # if not returned, raise a clear error
-        raise RuntimeError(f"DropboxIO.move failed after retries: {src} -> {dst} (overwrite={overwrite})")
+        if overwrite and self.exists(dst_path):
+            self.delete(dst_path)
+        self.dbx.files_move_v2(src_path, dst_path, autorename=False, allow_shared_folder=True)

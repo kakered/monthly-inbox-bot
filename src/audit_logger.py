@@ -1,87 +1,79 @@
 # -*- coding: utf-8 -*-
 """
 audit_logger.py
-Dropbox に残る JSONL 監査ログ（1行=1イベント）
+Write JSONL audit logs to Dropbox.
 
-- 1 run_id ごとに 1ファイル: /_system/logs/monthly_audit_<run_id>.jsonl
-- 途中で落ちても「できる限り」残すため、flush() は何度呼んでもOK
+- Append is implemented by download + re-upload (Dropbox has no append API).
+- Robust even if the log file doesn't exist yet.
 """
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import json
-import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+from .dropbox_io import DropboxIO
 
 
-def _norm_dir(p: str) -> str:
-    p = (p or "").strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    if len(p) > 1 and p.endswith("/"):
-        p = p[:-1]
-    return p
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _today_utc_ymd() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
 
 
 @dataclass
 class AuditLogger:
+    dbx: DropboxIO
     logs_dir: str
     run_id: str
-    buffer: list[dict[str, Any]] = field(default_factory=list)
 
-    def event(
-        self,
-        *,
-        stage: str,
-        event: str,
-        message: str | None = None,
-        src_path: str | None = None,
-        dst_path: str | None = None,
-        filename: str | None = None,
-        **extra: Any,
-    ) -> None:
-        rec: Dict[str, Any] = {
-            "timestamp": _now_iso(),
-            "run_id": self.run_id,
-            "stage": stage,
-            "event": event,
-        }
-        if message is not None:
-            rec["message"] = message
-        if src_path is not None:
-            rec["src_path"] = src_path
-        if dst_path is not None:
-            rec["dst_path"] = dst_path
-        if filename is not None:
-            rec["filename"] = filename
-        for k, v in extra.items():
-            if v is not None:
-                rec[k] = v
-        self.buffer.append(rec)
+    def _log_path(self) -> str:
+        day = _today_utc_ymd()
+        base = self.logs_dir.rstrip("/")
+        return f"{base}/{day}/audit_{self.run_id}.jsonl"
 
-    def flush(self, dbx: Any) -> None:
-        """
-        dbx は src.dropbox_io.DropboxIO を想定（write_file_bytes を持つ）
-        """
-        logs_dir = _norm_dir(self.logs_dir)
-        path = f"{logs_dir}/monthly_audit_{self.run_id}.jsonl"
-        data = ("\n".join(json.dumps(x, ensure_ascii=False) for x in self.buffer) + "\n").encode("utf-8")
-        dbx.write_file_bytes(path, data, overwrite=True)
+    def write(self, record: Dict[str, Any]) -> None:
+        rec = dict(record)
+        rec.setdefault("timestamp", _utc_now_iso())
+        rec.setdefault("run_id", self.run_id)
+
+        line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+        path = self._log_path()
+
+        try:
+            prev = b""
+            if self.dbx.exists(path):
+                prev = self.dbx.read_file_bytes(path)
+            self.dbx.write_file_bytes(path, prev + line, overwrite=True)
+        except Exception:
+            # last resort: write only the new line
+            self.dbx.write_file_bytes(path, line, overwrite=True)
 
 
-def build_run_id() -> str:
-    """
-    GitHub Actions 上なら GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT がある。
-    無ければローカル実行用に時刻ベース。
-    """
-    rid = os.getenv("GITHUB_RUN_ID", "").strip()
-    att = os.getenv("GITHUB_RUN_ATTEMPT", "").strip()
-    if rid:
-        return f"gh-{rid}-{att or '1'}"
-    return f"local-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+def write_audit_record(
+    dbx: DropboxIO,
+    logs_dir: str,
+    run_id: str,
+    stage: str,
+    event: str,
+    src_path: Optional[str] = None,
+    dst_path: Optional[str] = None,
+    filename: Optional[str] = None,
+    message: Optional[str] = None,
+    **extra: Any,
+) -> None:
+    logger = AuditLogger(dbx=dbx, logs_dir=logs_dir, run_id=run_id)
+    rec: Dict[str, Any] = {"stage": stage, "event": event}
+    if src_path is not None:
+        rec["src_path"] = src_path
+    if dst_path is not None:
+        rec["dst_path"] = dst_path
+    if filename is not None:
+        rec["filename"] = filename
+    if message is not None:
+        rec["message"] = message
+    rec.update(extra)
+    logger.write(rec)

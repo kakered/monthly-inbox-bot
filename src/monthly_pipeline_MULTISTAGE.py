@@ -2,219 +2,135 @@
 """
 monthly_pipeline_MULTISTAGE.py
 
-方針:
-- 1回のrunで1ステージだけ処理（one-stage-per-run）
-- どのステージを処理するかは "IN が空でない最初のステージ" を自動選択
-- 各ファイルについて audit JSONL を Dropbox(/_system/logs/) に必ず残す
-- state.json を必ず保存（落ちても原因追跡可能）
+One-stage-per-run multistage pipeline (currently COPY-ONLY).
 
-注意:
-- ここではまだ「編集/AI処理」は入れない（まず搬送 + 監査ログ + 安定性）
+Goals (now):
+- stage auto-selection (00->40) based on which IN has files
+- per stage: IN -> OUT (copy), then IN -> DONE (move)
+- forward same bytes to next stage IN (copy)
+- write JSONL audit logs to Dropbox
+
+Later you can replace the "transform" per stage (Excel edit, API, etc.)
+without changing the control flow.
 """
-
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
-from src.dropbox_io import DropboxIO
-from src.state_store import StateStore
-from src.monthly_spec import MonthlyCfg
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+from .dropbox_io import DropboxIO
+from .monthly_spec import MonthlyCfg
+from .utils_dropbox_item import is_file, get_path_lower
+from .audit_logger import write_audit_record
+from .state_store import StateStore
 
 
-def _log_path(cfg: MonthlyCfg, run_id: str) -> str:
-    # 1 run = 1 jsonl
-    return f"{cfg.logs_dir.rstrip('/')}/monthly_audit__{run_id}.jsonl"
-
-
-def _audit_append(dbx: DropboxIO, cfg: MonthlyCfg, run_id: str, rec: Dict[str, Any]) -> None:
-    """
-    JSONL を Dropbox 上の1ファイルに追記。
-    Dropboxは追記APIがやや面倒なので、サイズが小さい前提で「read→append→overwrite」。
-    監査ログが目的なので、失敗しても本体を止めない。
-    """
-    try:
-        path = _log_path(cfg, run_id)
-        line = json.dumps(rec, ensure_ascii=False) + "\n"
-        try:
-            prev = dbx.read_file_bytes(path)
-            new = prev + line.encode("utf-8")
-        except Exception:
-            new = line.encode("utf-8")
-        dbx.write_file_bytes(path, new, overwrite=True)
-    except Exception:
-        return
-
-
-def _stage_paths(cfg: MonthlyCfg) -> Dict[str, Dict[str, str]]:
+def _stage_paths(cfg: MonthlyCfg) -> Dict[str, Dict[str, Optional[str]]]:
     return {
         "00": {"IN": cfg.stage00_in, "OUT": cfg.stage00_out, "DONE": cfg.stage00_done, "NEXT_IN": cfg.stage10_in},
         "10": {"IN": cfg.stage10_in, "OUT": cfg.stage10_out, "DONE": cfg.stage10_done, "NEXT_IN": cfg.stage20_in},
         "20": {"IN": cfg.stage20_in, "OUT": cfg.stage20_out, "DONE": cfg.stage20_done, "NEXT_IN": cfg.stage30_in},
         "30": {"IN": cfg.stage30_in, "OUT": cfg.stage30_out, "DONE": cfg.stage30_done, "NEXT_IN": cfg.stage40_in},
-        "40": {"IN": cfg.stage40_in, "OUT": cfg.stage40_out, "DONE": cfg.stage40_done, "NEXT_IN": ""},  # last
+        "40": {"IN": cfg.stage40_in, "OUT": cfg.stage40_out, "DONE": cfg.stage40_done, "NEXT_IN": None},
     }
 
 
-def _select_stage_one_run(dbx: DropboxIO, cfg: MonthlyCfg, run_id: str) -> Tuple[Optional[str], List[Dict[str, Any]], Dict[str, Dict[str, str]]]:
-    sp = _stage_paths(cfg)
-
-    # monthly_stage が指定されていればそこから優先（ただし空なら auto）
+def _next_stage(stage: str) -> str:
     order = ["00", "10", "20", "30", "40"]
-    if cfg.monthly_stage and cfg.monthly_stage in order:
-        # 指定ステージから順に見る（例: 00固定でもOK）
-        start = order.index(cfg.monthly_stage)
-        order = order[start:] + order[:start]
+    if stage not in order:
+        return "--"
+    i = order.index(stage)
+    return order[i + 1] if i + 1 < len(order) else "--"
 
-    for st in order:
-        res = dbx.list_folder(sp[st]["IN"])
-        entries = res.get("entries", [])
-        files = [e for e in entries if e.get(".tag") == "file"]
-        _audit_append(dbx, cfg, run_id, {
-            "timestamp": _utc_now(),
-            "run_id": run_id,
-            "stage": st,
-            "event": "list",
-            "src_path": sp[st]["IN"],
-            "count": len(files),
-        })
+
+def _select_stage_one_run(dbx: DropboxIO, cfg: MonthlyCfg, run_id: str) -> Tuple[Optional[str], List[str], Dict[str, Dict[str, Optional[str]]]]:
+    """
+    Pick the first stage (00->40) that has at least 1 file in IN.
+    Returns: (stage, file_paths_in, stage_paths_map)
+    """
+    sp = _stage_paths(cfg)
+    for st in ["00", "10", "20", "30", "40"]:
+        in_dir = sp[st]["IN"]
+        if not in_dir:
+            continue
+        items = dbx.list_folder(in_dir)
+        files = [get_path_lower(x) for x in items if is_file(x)]
         if files:
             return st, files, sp
-
     return None, [], sp
 
 
 def run_multistage(dbx: DropboxIO, cfg: MonthlyCfg, run_id: str) -> int:
-    store = StateStore.load(dbx, cfg.state_path)
+    write_audit_record(dbx, cfg.logs_dir, run_id, stage="--", event="run_start",
+                       message="monthly pipeline start (one-stage-per-run; auto stage select)")
 
-    _audit_append(dbx, cfg, run_id, {
-        "timestamp": _utc_now(),
-        "run_id": run_id,
-        "stage": "--",
-        "event": "run_start",
-        "message": "monthly pipeline start (one-stage-per-run; auto stage select)",
-    })
+    store = StateStore(path=cfg.state_path)
+    try:
+        store.load(dbx)
+    except Exception:
+        pass
 
     stage, files, sp = _select_stage_one_run(dbx, cfg, run_id)
+
     if not stage:
-        _audit_append(dbx, cfg, run_id, {
-            "timestamp": _utc_now(),
-            "run_id": run_id,
-            "stage": "--",
-            "event": "run_end",
-            "message": "no input files in any IN folder",
-        })
-        # state も保存しておく（監査上）
-        store.save(dbx)
+        write_audit_record(dbx, cfg.logs_dir, run_id, stage="--", event="noop", message="no files in any IN")
+        try:
+            store.save(dbx)
+        except Exception:
+            pass
+        write_audit_record(dbx, cfg.logs_dir, run_id, stage="--", event="run_end", message="monthly pipeline end")
         return 0
 
-    paths = sp[stage]
+    in_dir = sp[stage]["IN"]
+    out_dir = sp[stage]["OUT"]
+    done_dir = sp[stage]["DONE"]
+    next_in = sp[stage]["NEXT_IN"]
+
+    write_audit_record(dbx, cfg.logs_dir, run_id, stage=stage, event="list", src_path=in_dir, count=len(files))
+
     processed = 0
+    maxn = max(1, int(cfg.max_files_per_run))
 
-    for f in files[: cfg.max_files_per_run]:
-        name = f.get("name", "")
-        src = f"{paths['IN'].rstrip('/')}/{name}"
-        out = f"{paths['OUT'].rstrip('/')}/{name}"
-        done = f"{paths['DONE'].rstrip('/')}/{name}"
-        next_in = paths.get("NEXT_IN") or ""
-        next_dst = f"{next_in.rstrip('/')}/{name}" if next_in else ""
-
+    for src_path in files[:maxn]:
+        filename = src_path.split("/")[-1]
         try:
-            # IN -> OUT (copy)
-            content = dbx.read_file_bytes(src)
-            dbx.write_file_bytes(out, content, overwrite=True)
-            _audit_append(dbx, cfg, run_id, {
-                "timestamp": _utc_now(),
-                "run_id": run_id,
-                "stage": stage,
-                "event": "write",
-                "src_path": src,
-                "dst_path": out,
-                "filename": name,
-                "size": len(content),
-            })
+            data = dbx.read_file_bytes(src_path)
 
-            # IN -> DONE (move)
-            dbx.move(src, done, overwrite=True)
-            _audit_append(dbx, cfg, run_id, {
-                "timestamp": _utc_now(),
-                "run_id": run_id,
-                "stage": stage,
-                "event": "move",
-                "src_path": src,
-                "dst_path": done,
-                "filename": name,
-            })
+            # OUT (copy-only)
+            dst_out = f"{out_dir.rstrip('/')}/{filename}"
+            dbx.write_file_bytes(dst_out, data, overwrite=True)
+            write_audit_record(dbx, cfg.logs_dir, run_id, stage=stage, event="write",
+                               src_path=src_path, dst_path=dst_out, filename=filename, size=len(data))
 
-            # forward to next stage IN (copy from DONE)
-            if next_dst:
-                content2 = dbx.read_file_bytes(done)
-                dbx.write_file_bytes(next_dst, content2, overwrite=True)
-                _audit_append(dbx, cfg, run_id, {
-                    "timestamp": _utc_now(),
-                    "run_id": run_id,
-                    "stage": (f"{int(stage)+10:02d}" if stage != "40" else "40"),
-                    "event": "write",
-                    "src_path": done,
-                    "dst_path": next_dst,
-                    "filename": name,
-                    "message": f"forward to stage{next_in.split('/')[1][:2]} IN" if "/" in next_in else "forward",
-                    "size": len(content2),
-                })
+            # IN -> DONE
+            dst_done = f"{done_dir.rstrip('/')}/{filename}"
+            dbx.move(src_path, dst_done, overwrite=True)
+            write_audit_record(dbx, cfg.logs_dir, run_id, stage=stage, event="move",
+                               src_path=src_path, dst_path=dst_done, filename=filename)
 
-            # state 更新（最小）
-            store.data.setdefault("processed", {})
-            store.data["processed"].setdefault(stage, [])
-            store.data["processed"][stage].append({"name": name, "ts": _utc_now()})
+            # forward to next stage IN
+            if next_in:
+                ns = _next_stage(stage)
+                dst_next = f"{next_in.rstrip('/')}/{filename}"
+                dbx.write_file_bytes(dst_next, data, overwrite=True)
+                write_audit_record(dbx, cfg.logs_dir, run_id, stage=ns, event="write",
+                                   src_path=dst_done, dst_path=dst_next, filename=filename, size=len(data),
+                                   message=f"forward to stage{ns} IN")
 
             processed += 1
 
         except Exception as e:
-            _audit_append(dbx, cfg, run_id, {
-                "timestamp": _utc_now(),
-                "run_id": run_id,
-                "stage": stage,
-                "event": "error",
-                "src_path": src,
-                "message": f"{type(e).__name__}({e!r})",
-            })
-            # 1件失敗しても run 自体は続けず止める（デバッグ優先）
-            break
+            write_audit_record(dbx, cfg.logs_dir, run_id, stage=stage, event="error",
+                               src_path=src_path, filename=filename, message=repr(e))
 
-    # state 保存（ここで malformed_path が出ないように dropbox_io/state_store を直した）
     try:
+        store.data.setdefault("runs", [])
+        store.data["runs"].append({"run_id": run_id, "stage": stage, "processed": processed})
         store.save(dbx)
-        _audit_append(dbx, cfg, run_id, {
-            "timestamp": _utc_now(),
-            "run_id": run_id,
-            "stage": "--",
-            "event": "write_state",
-            "filename": cfg.state_path,
-            "message": "state saved",
-        })
+        write_audit_record(dbx, cfg.logs_dir, run_id, stage="--", event="write_state",
+                           filename=cfg.state_path, message="state saved")
     except Exception as e:
-        _audit_append(dbx, cfg, run_id, {
-            "timestamp": _utc_now(),
-            "run_id": run_id,
-            "stage": "--",
-            "event": "error",
-            "message": f"state_save_failed: {type(e).__name__}({e!r})",
-        })
-        return 1
+        write_audit_record(dbx, cfg.logs_dir, run_id, stage="--", event="error",
+                           message=f"state_save_failed: {repr(e)}")
 
-    _audit_append(dbx, cfg, run_id, {
-        "timestamp": _utc_now(),
-        "run_id": run_id,
-        "stage": "--",
-        "event": "run_end",
-        "message": "monthly pipeline end",
-    })
-
-    # 何か失敗して break していれば processed は 0/途中、でも state 保存できてれば rc=0 に寄せる
-    return 0
+    write_audit_record(dbx, cfg.logs_dir, run_id, stage="--", event="run_end", message="monthly pipeline end")
+    return processed
