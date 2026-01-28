@@ -1,43 +1,41 @@
 # -*- coding: utf-8 -*-
-"""monthly_main.py
-Entry point for GitHub Actions.
-
-- builds config from env
-- creates Dropbox client
-- runs one-stage-per-run pipeline
-"""
 
 from __future__ import annotations
 
 import os
-import sys
 import time
-import traceback
+from datetime import datetime, timezone
 
-from .dropbox_io import DropboxIO
-from .monthly_spec import MonthlyCfg
-from .monthly_pipeline_MULTISTAGE import run_multistage
+import dropbox
+
+from src.dropbox_io import DropboxIO
+from src.monthly_spec import MonthlyCfg
+from src.state_store import StateStore
+from src.monthly_pipeline_MULTISTAGE import run_multistage
 
 
-def _run_id() -> str:
-    # Prefer GitHub-provided IDs; fallback to timestamp
-    run = (os.getenv("GITHUB_RUN_ID") or "").strip()
-    attempt = (os.getenv("GITHUB_RUN_ATTEMPT") or "").strip()
-    if run:
-        return f"gh-{run}-{attempt or '1'}"
-    return time.strftime("local-%Y%m%d-%H%M%S", time.gmtime())
+def _make_run_id() -> str:
+    # GitHub Actions の run id が取れればそれを使い、なければUTC時刻
+    rid = os.environ.get("GITHUB_RUN_ID")
+    if rid:
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+        return f"gh-{rid}-{attempt}"
+    return datetime.now(timezone.utc).strftime("utc-%Y%m%d-%H%M%S")
 
 
 def main() -> int:
     cfg = MonthlyCfg.from_env()
-    dbx = DropboxIO.from_env()
+    run_id = _make_run_id()
 
-    rid = _run_id()
-    try:
-        return int(run_multistage(dbx, cfg, run_id=rid) or 0)
-    except Exception:
-        traceback.print_exc(file=sys.stderr)
-        return 1
+    dbx = dropbox.Dropbox(
+        oauth2_refresh_token=os.environ["DROPBOX_REFRESH_TOKEN"],
+        app_key=os.environ["DROPBOX_APP_KEY"],
+        app_secret=os.environ["DROPBOX_APP_SECRET"],
+    )
+    io = DropboxIO(dbx)
+
+    # state は pipeline 内で更新・保存する
+    return int(run_multistage(io, cfg, run_id=run_id) or 0)
 
 
 if __name__ == "__main__":

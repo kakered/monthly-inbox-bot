@@ -1,214 +1,220 @@
 # -*- coding: utf-8 -*-
-"""monthly_pipeline_MULTISTAGE.py
-Monthly pipeline runner.
+"""
+monthly_pipeline_MULTISTAGE.py
 
-Stability-first:
-- one-stage-per-run (a single run processes only ONE stage)
-- stage selection is automatic starting from cfg.monthly_stage:
-    try 00; if empty then 10 -> 20 -> 30 -> 40
-  => you usually DON'T need to edit workflow env each time.
+方針:
+- 1回のrunで1ステージだけ処理（one-stage-per-run）
+- どのステージを処理するかは "IN が空でない最初のステージ" を自動選択
+- 各ファイルについて audit JSONL を Dropbox(/_system/logs/) に必ず残す
+- state.json を必ず保存（落ちても原因追跡可能）
 
-Stages:
-- 00: copy to OUT, move to DONE, forward to stage10/IN
-- 10: read xlsx -> generate 2 xlsx -> write to OUT, move original to DONE, forward outputs to stage20/IN
-- 20/30/40: copy-only passthrough (placeholder)
+注意:
+- ここではまだ「編集/AI処理」は入れない（まず搬送 + 監査ログ + 安定性）
 """
 
 from __future__ import annotations
 
-import traceback
-from typing import Any, Dict, Tuple
+import json
+from dataclasses import asdict
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Tuple, Optional
 
-from dropbox.files import FileMetadata
-
-from .dropbox_io import DropboxIO
-from .excel_exporter import process_monthly_workbook
-from .state_store import StateStore, stable_key
-
-
-def _is_file(md: Any) -> bool:
-    return isinstance(md, FileMetadata)
+from src.dropbox_io import DropboxIO
+from src.state_store import StateStore
+from src.monthly_spec import MonthlyCfg
 
 
-def _stage_paths(cfg) -> Dict[str, Dict[str, str]]:
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _log_path(cfg: MonthlyCfg, run_id: str) -> str:
+    # 1 run = 1 jsonl
+    return f"{cfg.logs_dir.rstrip('/')}/monthly_audit__{run_id}.jsonl"
+
+
+def _audit_append(dbx: DropboxIO, cfg: MonthlyCfg, run_id: str, rec: Dict[str, Any]) -> None:
+    """
+    JSONL を Dropbox 上の1ファイルに追記。
+    Dropboxは追記APIがやや面倒なので、サイズが小さい前提で「read→append→overwrite」。
+    監査ログが目的なので、失敗しても本体を止めない。
+    """
+    try:
+        path = _log_path(cfg, run_id)
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        try:
+            prev = dbx.read_file_bytes(path)
+            new = prev + line.encode("utf-8")
+        except Exception:
+            new = line.encode("utf-8")
+        dbx.write_file_bytes(path, new, overwrite=True)
+    except Exception:
+        return
+
+
+def _stage_paths(cfg: MonthlyCfg) -> Dict[str, Dict[str, str]]:
     return {
         "00": {"IN": cfg.stage00_in, "OUT": cfg.stage00_out, "DONE": cfg.stage00_done, "NEXT_IN": cfg.stage10_in},
         "10": {"IN": cfg.stage10_in, "OUT": cfg.stage10_out, "DONE": cfg.stage10_done, "NEXT_IN": cfg.stage20_in},
         "20": {"IN": cfg.stage20_in, "OUT": cfg.stage20_out, "DONE": cfg.stage20_done, "NEXT_IN": cfg.stage30_in},
         "30": {"IN": cfg.stage30_in, "OUT": cfg.stage30_out, "DONE": cfg.stage30_done, "NEXT_IN": cfg.stage40_in},
-        "40": {"IN": cfg.stage40_in, "OUT": cfg.stage40_out, "DONE": cfg.stage40_done, "NEXT_IN": ""},
+        "40": {"IN": cfg.stage40_in, "OUT": cfg.stage40_out, "DONE": cfg.stage40_done, "NEXT_IN": ""},  # last
     }
 
 
-def _join(dir_path: str, filename: str) -> str:
-    return f"{dir_path.rstrip('/')}/{filename}"
-
-
-def _write_bytes(dbx: DropboxIO, dst: str, data: bytes) -> None:
-    dbx.write_file_bytes(dst, data, overwrite=True)
-
-
-def _copy_file(dbx: DropboxIO, src: str, dst: str) -> int:
-    b = dbx.download_to_bytes(src)
-    _write_bytes(dbx, dst, b)
-    return len(b)
-
-
-def _safe_basename(name: str) -> str:
-    return name.replace("/", "_").strip()
-
-
-def _split_ext(filename: str) -> Tuple[str, str]:
-    if "." not in filename:
-        return filename, ""
-    base, ext = filename.rsplit(".", 1)
-    return base, "." + ext
-
-
-def _select_stage_one_run(dbx: DropboxIO, cfg, sp: Dict[str, Dict[str, str]]) -> tuple[str, list[FileMetadata], str]:
-    order = ["00", "10", "20", "30", "40"]
-
-    start = (cfg.monthly_stage or "00").strip()
-    if start not in sp:
-        start = "00"
-
-    try:
-        start_idx = order.index(start)
-    except ValueError:
-        start_idx = 0
-
-    for st in order[start_idx:]:
-        in_dir = sp[st]["IN"]
-        files = [e for e in dbx.list_folder(in_dir) if _is_file(e)]
-        files = sorted(files, key=lambda e: (e.name or "").lower())[: int(cfg.max_files_per_run or 200)]
-        if files:
-            return st, files, in_dir
-
-    return start, [], sp[start]["IN"]
-
-
-def run_multistage(dbx: DropboxIO, cfg, run_id: str) -> int:
+def _select_stage_one_run(dbx: DropboxIO, cfg: MonthlyCfg, run_id: str) -> Tuple[Optional[str], List[Dict[str, Any]], Dict[str, Dict[str, str]]]:
     sp = _stage_paths(cfg)
+
+    # monthly_stage が指定されていればそこから優先（ただし空なら auto）
+    order = ["00", "10", "20", "30", "40"]
+    if cfg.monthly_stage and cfg.monthly_stage in order:
+        # 指定ステージから順に見る（例: 00固定でもOK）
+        start = order.index(cfg.monthly_stage)
+        order = order[start:] + order[:start]
+
+    for st in order:
+        res = dbx.list_folder(sp[st]["IN"])
+        entries = res.get("entries", [])
+        files = [e for e in entries if e.get(".tag") == "file"]
+        _audit_append(dbx, cfg, run_id, {
+            "timestamp": _utc_now(),
+            "run_id": run_id,
+            "stage": st,
+            "event": "list",
+            "src_path": sp[st]["IN"],
+            "count": len(files),
+        })
+        if files:
+            return st, files, sp
+
+    return None, [], sp
+
+
+def run_multistage(dbx: DropboxIO, cfg: MonthlyCfg, run_id: str) -> int:
     store = StateStore.load(dbx, cfg.state_path)
 
-    store.log(run_id=run_id, stage="--", event="run_start", message="monthly pipeline start (one-stage-per-run; auto stage select)")
+    _audit_append(dbx, cfg, run_id, {
+        "timestamp": _utc_now(),
+        "run_id": run_id,
+        "stage": "--",
+        "event": "run_start",
+        "message": "monthly pipeline start (one-stage-per-run; auto stage select)",
+    })
 
-    stage, entries, in_dir = _select_stage_one_run(dbx, cfg, sp)
-    store.log(run_id=run_id, stage=stage, event="list", src_path=in_dir, count=len(entries))
+    stage, files, sp = _select_stage_one_run(dbx, cfg, run_id)
+    if not stage:
+        _audit_append(dbx, cfg, run_id, {
+            "timestamp": _utc_now(),
+            "run_id": run_id,
+            "stage": "--",
+            "event": "run_end",
+            "message": "no input files in any IN folder",
+        })
+        # state も保存しておく（監査上）
+        store.save(dbx)
+        return 0
 
-    processed_count = 0
-    for md in entries:
-        src_path = getattr(md, "path_display", None) or _join(in_dir, md.name)
-        fid = getattr(md, "id", None)
-        key = stable_key(stage, fid, src_path)
+    paths = sp[stage]
+    processed = 0
 
-        if store.is_processed(key):
-            continue
+    for f in files[: cfg.max_files_per_run]:
+        name = f.get("name", "")
+        src = f"{paths['IN'].rstrip('/')}/{name}"
+        out = f"{paths['OUT'].rstrip('/')}/{name}"
+        done = f"{paths['DONE'].rstrip('/')}/{name}"
+        next_in = paths.get("NEXT_IN") or ""
+        next_dst = f"{next_in.rstrip('/')}/{name}" if next_in else ""
 
         try:
-            if stage == "00":
-                processed_count += _handle_stage00(dbx, store, run_id, sp, md, src_path)
-            elif stage == "10":
-                processed_count += _handle_stage10(dbx, store, run_id, sp, md, src_path)
-            else:
-                processed_count += _handle_copy_only(stage, dbx, store, run_id, sp, md, src_path)
+            # IN -> OUT (copy)
+            content = dbx.read_file_bytes(src)
+            dbx.write_file_bytes(out, content, overwrite=True)
+            _audit_append(dbx, cfg, run_id, {
+                "timestamp": _utc_now(),
+                "run_id": run_id,
+                "stage": stage,
+                "event": "write",
+                "src_path": src,
+                "dst_path": out,
+                "filename": name,
+                "size": len(content),
+            })
 
-            store.mark_processed(key, f"{stage}:{run_id}")
-            store.add_done(src_path)
+            # IN -> DONE (move)
+            dbx.move(src, done, overwrite=True)
+            _audit_append(dbx, cfg, run_id, {
+                "timestamp": _utc_now(),
+                "run_id": run_id,
+                "stage": stage,
+                "event": "move",
+                "src_path": src,
+                "dst_path": done,
+                "filename": name,
+            })
+
+            # forward to next stage IN (copy from DONE)
+            if next_dst:
+                content2 = dbx.read_file_bytes(done)
+                dbx.write_file_bytes(next_dst, content2, overwrite=True)
+                _audit_append(dbx, cfg, run_id, {
+                    "timestamp": _utc_now(),
+                    "run_id": run_id,
+                    "stage": (f"{int(stage)+10:02d}" if stage != "40" else "40"),
+                    "event": "write",
+                    "src_path": done,
+                    "dst_path": next_dst,
+                    "filename": name,
+                    "message": f"forward to stage{next_in.split('/')[1][:2]} IN" if "/" in next_in else "forward",
+                    "size": len(content2),
+                })
+
+            # state 更新（最小）
+            store.data.setdefault("processed", {})
+            store.data["processed"].setdefault(stage, [])
+            store.data["processed"][stage].append({"name": name, "ts": _utc_now()})
+
+            processed += 1
 
         except Exception as e:
-            store.add_error({"stage": stage, "path": src_path, "error": repr(e), "traceback": traceback.format_exc()})
-            store.log(run_id=run_id, stage=stage, event="error", src_path=src_path, message=repr(e))
+            _audit_append(dbx, cfg, run_id, {
+                "timestamp": _utc_now(),
+                "run_id": run_id,
+                "stage": stage,
+                "event": "error",
+                "src_path": src,
+                "message": f"{type(e).__name__}({e!r})",
+            })
+            # 1件失敗しても run 自体は続けず止める（デバッグ優先）
+            break
 
-    store.save(dbx)
-    store.log(run_id=run_id, stage="--", event="write_state", filename=cfg.state_path, message="state saved")
-    store.log(run_id=run_id, stage="--", event="run_end", message="monthly pipeline end")
-    store.flush_audit_jsonl(dbx, cfg.logs_dir, run_id)
+    # state 保存（ここで malformed_path が出ないように dropbox_io/state_store を直した）
+    try:
+        store.save(dbx)
+        _audit_append(dbx, cfg, run_id, {
+            "timestamp": _utc_now(),
+            "run_id": run_id,
+            "stage": "--",
+            "event": "write_state",
+            "filename": cfg.state_path,
+            "message": "state saved",
+        })
+    except Exception as e:
+        _audit_append(dbx, cfg, run_id, {
+            "timestamp": _utc_now(),
+            "run_id": run_id,
+            "stage": "--",
+            "event": "error",
+            "message": f"state_save_failed: {type(e).__name__}({e!r})",
+        })
+        return 1
 
-    return processed_count
+    _audit_append(dbx, cfg, run_id, {
+        "timestamp": _utc_now(),
+        "run_id": run_id,
+        "stage": "--",
+        "event": "run_end",
+        "message": "monthly pipeline end",
+    })
 
-
-def _handle_stage00(dbx: DropboxIO, store: StateStore, run_id: str, sp, md: FileMetadata, src_path: str) -> int:
-    stage = "00"
-    filename = _safe_basename(md.name)
-    out_path = _join(sp[stage]["OUT"], filename)
-    done_path = _join(sp[stage]["DONE"], filename)
-
-    size = _copy_file(dbx, src_path, out_path)
-    store.log(run_id=run_id, stage=stage, event="write", src_path=src_path, dst_path=out_path, filename=filename, size=size)
-
-    # IMPORTANT: DropboxIO.move() does NOT accept overwrite= as keyword in your current implementation.
-    # Use positional third argument for overwrite (True).
-    dbx.move(src_path, done_path, True)
-    store.log(run_id=run_id, stage=stage, event="move", src_path=src_path, dst_path=done_path, filename=filename)
-
-    next_in = sp[stage].get("NEXT_IN") or ""
-    if next_in:
-        next_path = _join(next_in, filename)
-        size2 = _copy_file(dbx, done_path, next_path)
-        store.log(run_id=run_id, stage="10", event="write", src_path=done_path, dst_path=next_path, filename=filename, message="forward to stage10 IN", size=size2)
-
-    return 1
-
-
-def _handle_stage10(dbx: DropboxIO, store: StateStore, run_id: str, sp, md: FileMetadata, src_path: str) -> int:
-    stage = "10"
-    filename = _safe_basename(md.name)
-    base, ext = _split_ext(filename)
-
-    if ext.lower() != ".xlsx":
-        return _handle_copy_only(stage, dbx, store, run_id, sp, md, src_path)
-
-    in_bytes = dbx.download_to_bytes(src_path)
-    overview_bytes, per_person_bytes = process_monthly_workbook(in_bytes)
-
-    tag = run_id.replace("/", "-")
-    overview_name = f"{base}__00to10__overview__{tag}.xlsx"
-    per_person_name = f"{base}__00to10__per_person__{tag}.xlsx"
-
-    out_overview = _join(sp[stage]["OUT"], overview_name)
-    out_per = _join(sp[stage]["OUT"], per_person_name)
-
-    _write_bytes(dbx, out_overview, overview_bytes)
-    store.log(run_id=run_id, stage=stage, event="write", src_path=src_path, dst_path=out_overview, filename=overview_name, size=len(overview_bytes))
-
-    _write_bytes(dbx, out_per, per_person_bytes)
-    store.log(run_id=run_id, stage=stage, event="write", src_path=src_path, dst_path=out_per, filename=per_person_name, size=len(per_person_bytes))
-
-    done_path = _join(sp[stage]["DONE"], filename)
-    dbx.move(src_path, done_path, True)
-    store.log(run_id=run_id, stage=stage, event="move", src_path=src_path, dst_path=done_path, filename=filename)
-
-    next_in = sp[stage].get("NEXT_IN") or ""
-    if next_in:
-        next_overview = _join(next_in, overview_name)
-        next_per = _join(next_in, per_person_name)
-
-        _write_bytes(dbx, next_overview, overview_bytes)
-        store.log(run_id=run_id, stage="20", event="write", src_path=done_path, dst_path=next_overview, filename=overview_name, message="forward to stage20 IN", size=len(overview_bytes))
-
-        _write_bytes(dbx, next_per, per_person_bytes)
-        store.log(run_id=run_id, stage="20", event="write", src_path=done_path, dst_path=next_per, filename=per_person_name, message="forward to stage20 IN", size=len(per_person_bytes))
-
-    return 1
-
-
-def _handle_copy_only(stage: str, dbx: DropboxIO, store: StateStore, run_id: str, sp, md: FileMetadata, src_path: str) -> int:
-    filename = _safe_basename(md.name)
-    out_path = _join(sp[stage]["OUT"], filename)
-    done_path = _join(sp[stage]["DONE"], filename)
-
-    size = _copy_file(dbx, src_path, out_path)
-    store.log(run_id=run_id, stage=stage, event="write", src_path=src_path, dst_path=out_path, filename=filename, size=size)
-
-    dbx.move(src_path, done_path, True)
-    store.log(run_id=run_id, stage=stage, event="move", src_path=src_path, dst_path=done_path, filename=filename)
-
-    next_in = sp[stage].get("NEXT_IN") or ""
-    if next_in:
-        next_path = _join(next_in, filename)
-        size2 = _copy_file(dbx, done_path, next_path)
-        next_stage = str(int(stage) + 10).zfill(2)
-        store.log(run_id=run_id, stage=next_stage, event="write", src_path=done_path, dst_path=next_path, filename=filename, message=f"forward to stage{next_stage} IN", size=size2)
-
-    return 1
+    # 何か失敗して break していれば processed は 0/途中、でも state 保存できてれば rc=0 に寄せる
+    return 0
