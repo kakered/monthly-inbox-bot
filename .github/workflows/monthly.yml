@@ -16,7 +16,6 @@ on:
         required: false
         default: "200"
   schedule:
-    # 必要に応じて調整（例：22分おき）
     - cron: "*/22 * * * *"
 
 concurrency:
@@ -34,8 +33,10 @@ jobs:
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
 
+      # STATE_PATH は「vars優先」。無い場合だけ secrets を使う（ifでは使わない）
+      STATE_PATH: ${{ vars.STATE_PATH != '' && vars.STATE_PATH || secrets.STATE_PATH }}
+
       # --- Repo Variables (paths / config) ---
-      STATE_PATH: ${{ vars.STATE_PATH }}
       LOGS_DIR: ${{ vars.LOGS_DIR }}
 
       STAGE00_IN: ${{ vars.STAGE00_IN }}
@@ -58,7 +59,7 @@ jobs:
       STAGE40_OUT: ${{ vars.STAGE40_OUT }}
       STAGE40_DONE: ${{ vars.STAGE40_DONE }}
 
-      # --- Runtime knobs (prefer workflow_dispatch inputs, fallback vars, then defaults) ---
+      # --- Runtime knobs (workflow_dispatch inputs > vars > defaults) ---
       MONTHLY_STAGE: ${{ inputs.monthly_stage != '' && inputs.monthly_stage || vars.MONTHLY_STAGE != '' && vars.MONTHLY_STAGE || '00' }}
       DEPTH: ${{ inputs.depth != '' && inputs.depth || vars.DEPTH != '' && vars.DEPTH || 'medium' }}
       OPENAI_MODEL: ${{ vars.OPENAI_MODEL != '' && vars.OPENAI_MODEL || 'gpt-5-mini' }}
@@ -88,8 +89,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 安全なサニティチェック（秘密は出さない：長さとsha256先頭のみ）
-      - name: Sanity check Dropbox vars (safe)
+      - name: Sanity check env (safe)
         shell: bash
         run: |
           set -euxo pipefail
@@ -116,7 +116,7 @@ jobs:
             print(f"{k}: len={len(v)}")
           PY
 
-      - name: Compile + import check
+      - name: Preflight (compile + import)
         shell: bash
         run: |
           set -euxo pipefail
@@ -124,8 +124,7 @@ jobs:
           python -m compileall -q src
           python -c "import src.monthly_main; print('import ok')"
 
-      # ここが本体：runpy wrapper（失敗時のログを綺麗に出す）
-      - name: Run monthly pipeline
+      - name: Run pipeline (wrapper)
         shell: bash
         run: |
           set -euxo pipefail
@@ -147,8 +146,7 @@ jobs:
             print(f"[wrapper] END (elapsed_s={time.time()-t0:.2f})")
           PY
 
-      # 実行後の確認（DropboxのIN/OUT/DONEと最新ログ末尾）
-      - name: Post-run: list stage folders + tail latest log (safe-ish)
+      - name: Post-run snapshot (Dropbox IN/OUT/DONE + tail latest log)
         if: ${{ always() }}
         shell: bash
         run: |
@@ -165,8 +163,7 @@ jobs:
           stage = (os.environ.get("MONTHLY_STAGE","00") or "00").strip()
 
           def pick(stage: str, kind: str) -> str:
-              key = f"STAGE{stage}_{kind}"
-              return os.environ.get(key, "") or ""
+              return os.environ.get(f"STAGE{stage}_{kind}", "") or ""
 
           p_in = pick(stage, "IN")
           p_out = pick(stage, "OUT")
@@ -184,18 +181,12 @@ jobs:
               except ApiError as e:
                   print("ERROR list_folder:", e)
                   return
-              entries = res.entries
-              print("count:", len(entries))
-              for e in entries[:limit]:
-                  t = type(e).__name__
-                  pd = getattr(e, "path_display", "")
-                  sz = getattr(e, "size", "")
-                  print(t, pd, sz)
+              print("count:", len(res.entries))
+              for e in res.entries[:limit]:
+                  print(type(e).__name__, getattr(e, "path_display",""), getattr(e, "size",""))
 
           print("== stage ==", stage)
-          list_folder(p_in)
-          list_folder(p_out)
-          list_folder(p_done)
+          list_folder(p_in); list_folder(p_out); list_folder(p_done)
 
           print(f"\n== tail latest log: logs_dir={logs_dir!r} ==")
           if not logs_dir:
@@ -217,14 +208,12 @@ jobs:
                   print("no log files in latest folder")
                   raise SystemExit(0)
               latest = sorted(files, key=lambda x: x.server_modified)[-1]
-              latest_file = latest.path_display
-              print("latest_file:", latest_file, "size:", latest.size)
+              print("latest_file:", latest.path_display, "size:", latest.size)
 
-              _, resp = dbx.files_download(latest_file)
+              _, resp = dbx.files_download(latest.path_display)
               raw = resp.content.decode("utf-8", errors="replace")
-              tail = raw[-3000:]
               print("\n----- LOG TAIL (last ~3000 chars) -----\n")
-              print(tail)
+              print(raw[-3000:])
               print("\n----- END LOG TAIL -----\n")
           except ApiError as e:
               print("log tail error:", e)
