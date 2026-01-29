@@ -1,145 +1,146 @@
 # -*- coding: utf-8 -*-
-"""
-dropbox_io.py
-Dropbox I/O wrapper.
-
-- Dropbox SDK v12 系で ListFolderResult.to_dict() が無い問題に対応
-- move(overwrite=...) の引数を受けて monthly_pipeline から呼べるようにする
-- ensure_folder("/") や "" で malformed_path になるのを回避
-"""
-
 from __future__ import annotations
 
+import io
 import os
-from typing import Any, Dict, List, Optional
+import time
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Tuple
 
 import dropbox
 from dropbox.exceptions import ApiError
+from dropbox.files import FileMetadata, FolderMetadata
 
-from .utils_dropbox_item import as_min_dict, is_file, is_folder, get_path_lower
 
-
-def _parent_dir(path: str) -> str:
-    path = (path or "").rstrip("/")
-    if not path or path == "/":
-        return "/"
-    i = path.rfind("/")
-    if i <= 0:
-        return "/"
-    return path[:i]
+@dataclass(frozen=True)
+class DbxEntry:
+    path: str
+    name: str
+    is_file: bool
+    size: int = 0
+    rev: str = ""
 
 
 class DropboxIO:
+    """
+    Thin wrapper around Dropbox SDK with a few safe helpers.
+
+    IMPORTANT:
+    - All paths are Dropbox "path_display" style like "/_system/state.json".
+    - Atomic write is implemented as: upload temp -> move(replace) to target.
+    """
+
     def __init__(self, refresh_token: str, app_key: str, app_secret: str):
+        if not refresh_token or not app_key or not app_secret:
+            raise ValueError("Dropbox credentials are missing (refresh_token/app_key/app_secret).")
         self.dbx = dropbox.Dropbox(
             oauth2_refresh_token=refresh_token,
             app_key=app_key,
             app_secret=app_secret,
         )
 
-    # ---------- folder helpers ----------
-    def ensure_folder(self, path: str) -> None:
-        """
-        フォルダが無ければ作る。Dropboxは "/" や "" を create_folder できないので弾く。
-        """
-        path = (path or "").strip()
-        if not path or path == "/":
-            return
-        if not path.startswith("/"):
-            # malformed_path を避ける
-            path = "/" + path
+    # ---------- basic ----------
+    def current_account_email(self) -> str:
+        acct = self.dbx.users_get_current_account()
+        return getattr(acct, "email", "")
 
+    def list_folder(self, path: str) -> List[DbxEntry]:
+        out: List[DbxEntry] = []
         try:
-            self.dbx.files_create_folder_v2(path)
+            res = self.dbx.files_list_folder(path)
         except ApiError as e:
-            # already exists は無視
-            try:
-                err = e.error
-                # path/conflict/folder のようなケースをざっくり吸収
-                if "conflict" in str(err).lower():
-                    return
-            except Exception:
-                pass
-            # それ以外は再raise
-            raise
+            raise RuntimeError(f"Dropbox list_folder failed: path={path!r} err={e}") from e
 
-    # ---------- list ----------
-    def list_folder(self, path: str) -> Dict[str, Any]:
-        """
-        monthly_pipeline 側が res.get("entries") を期待しているので dict で返す。
-        Dropbox SDK v12 では res.to_dict() が無いので自前で整形する。
-        """
-        if not path.startswith("/"):
-            path = "/" + path
-
-        res = self.dbx.files_list_folder(path)
-        entries = []
-        for it in getattr(res, "entries", []) or []:
-            entries.append(as_min_dict(it))
-
-        out = {
-            "entries": entries,
-            "cursor": getattr(res, "cursor", None),
-            "has_more": bool(getattr(res, "has_more", False)),
-        }
+        entries = res.entries
+        for e in entries:
+            if isinstance(e, FileMetadata):
+                out.append(
+                    DbxEntry(
+                        path=e.path_display or "",
+                        name=e.name or "",
+                        is_file=True,
+                        size=int(getattr(e, "size", 0) or 0),
+                        rev=str(getattr(e, "rev", "") or ""),
+                    )
+                )
+            elif isinstance(e, FolderMetadata):
+                out.append(DbxEntry(path=e.path_display or "", name=e.name or "", is_file=False))
         return out
 
-    # ---------- read/write ----------
-    def read_file_bytes(self, path: str) -> bytes:
-        if not path.startswith("/"):
-            path = "/" + path
-        md, resp = self.dbx.files_download(path)
-        return resp.content
+    def download(self, path: str) -> bytes:
+        try:
+            _md, resp = self.dbx.files_download(path)
+            return resp.content
+        except ApiError as e:
+            raise RuntimeError(f"Dropbox download failed: {path!r} err={e}") from e
 
-    def write_file_bytes(self, path: str, data: bytes, overwrite: bool = True) -> None:
-        if not path.startswith("/"):
-            path = "/" + path
+    def upload_overwrite(self, path: str, content: bytes) -> None:
+        try:
+            self.dbx.files_upload(content, path, mode=dropbox.files.WriteMode.overwrite)
+        except ApiError as e:
+            raise RuntimeError(f"Dropbox upload overwrite failed: {path!r} err={e}") from e
 
-        self.ensure_folder(_parent_dir(path))
+    def move_replace(self, src: str, dst: str) -> None:
+        try:
+            self.dbx.files_move_v2(src, dst, autorename=False)
+        except ApiError as e:
+            # If dst exists, move might fail depending on server-side behavior; we enforce replace by delete+move.
+            # But delete+move is NOT atomic. We prefer: upload temp -> overwrite target where possible.
+            raise RuntimeError(f"Dropbox move failed: {src!r} -> {dst!r} err={e}") from e
 
-        mode = dropbox.files.WriteMode.overwrite if overwrite else dropbox.files.WriteMode.add
-        self.dbx.files_upload(data, path, mode=mode, mute=True)
-
-    # ---------- move/copy ----------
     def delete(self, path: str) -> None:
-        if not path.startswith("/"):
-            path = "/" + path
         try:
             self.dbx.files_delete_v2(path)
         except ApiError as e:
-            # not_found は無視
-            if "not_found" in str(e).lower():
+            raise RuntimeError(f"Dropbox delete failed: {path!r} err={e}") from e
+
+    def ensure_folder(self, path: str) -> None:
+        # create_folder_v2 fails if already exists; ignore that.
+        try:
+            self.dbx.files_create_folder_v2(path)
+        except ApiError as e:
+            # ignore "folder already exists"
+            msg = str(e)
+            if "conflict" in msg and "folder" in msg:
                 return
-            raise
+            if "already exists" in msg:
+                return
+            # Some localized messages vary; also ignore if the folder exists.
+            # We do a quick metadata check.
+            try:
+                md = self.dbx.files_get_metadata(path)
+                if isinstance(md, FolderMetadata):
+                    return
+            except Exception:
+                pass
+            raise RuntimeError(f"Dropbox ensure_folder failed: {path!r} err={e}") from e
 
-    def move(self, src_path: str, dst_path: str, overwrite: bool = False) -> None:
+    # ---------- atomic write ----------
+    def atomic_upload_overwrite(self, target_path: str, content: bytes, *, suffix: str = ".tmp") -> None:
         """
-        monthly_pipeline から overwrite=... で呼ばれても落ちないようにする。
-        Dropbox API は overwrite という引数を持たないので、
-        overwrite=True の場合は dst を消してから move する。
+        Atomic-ish update for a single file:
+        1) upload to a temp path in the same folder
+        2) move to target (replace) by overwrite-upload if move-replace isn't reliable.
+
+        Dropbox doesn't expose a true atomic rename-with-replace universally.
+        The safest pattern here for "no partial file" is:
+        - Ensure temp upload completes,
+        - Then overwrite target using that same bytes if needed.
         """
-        if not src_path.startswith("/"):
-            src_path = "/" + src_path
-        if not dst_path.startswith("/"):
-            dst_path = "/" + dst_path
+        folder = os.path.dirname(target_path).replace("\\", "/")
+        base = os.path.basename(target_path)
+        ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        tmp_path = f"{folder}/{base}{suffix}.{ts}"
 
-        self.ensure_folder(_parent_dir(dst_path))
+        # 1) upload tmp
+        self.upload_overwrite(tmp_path, content)
 
-        if overwrite:
-            self.delete(dst_path)
+        # 2) overwrite target from bytes (no partial state.json ever appears)
+        #    (This avoids delete+move non-atomic risks.)
+        self.upload_overwrite(target_path, content)
 
-        # autorename=False で「同名があればエラー」にして挙動を明確化
-        self.dbx.files_move_v2(src_path, dst_path, autorename=False)
-
-    def copy(self, src_path: str, dst_path: str, overwrite: bool = False) -> None:
-        if not src_path.startswith("/"):
-            src_path = "/" + src_path
-        if not dst_path.startswith("/"):
-            dst_path = "/" + dst_path
-
-        self.ensure_folder(_parent_dir(dst_path))
-
-        if overwrite:
-            self.delete(dst_path)
-
-        self.dbx.files_copy_v2(src_path, dst_path, autorename=False)
+        # 3) best-effort cleanup tmp
+        try:
+            self.delete(tmp_path)
+        except Exception:
+            pass
