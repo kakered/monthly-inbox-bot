@@ -35,12 +35,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---- Sanity check: show only lengths/hashes (no secret leak) ----
-      - name: Sanity check Dropbox paths (no secret leak)
+      - name: Sanity check Dropbox vars (safe)
         shell: bash
         env:
-          # Repo variables (plain text)
           LOGS_DIR: ${{ vars.LOGS_DIR }}
+          STATE_PATH: ${{ vars.STATE_PATH }}
           STAGE00_IN: ${{ vars.STAGE00_IN }}
           STAGE00_OUT: ${{ vars.STAGE00_OUT }}
           STAGE00_DONE: ${{ vars.STAGE00_DONE }}
@@ -56,141 +55,23 @@ jobs:
           STAGE40_IN: ${{ vars.STAGE40_IN }}
           STAGE40_OUT: ${{ vars.STAGE40_OUT }}
           STAGE40_DONE: ${{ vars.STAGE40_DONE }}
-          # Secrets (length only)
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
-          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-          STATE_PATH: ${{ secrets.STATE_PATH }}
         run: |
           set -euxo pipefail
           python - <<'PY'
           import os, hashlib
-
-          def short_hash(s: str) -> str:
-              return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
-
-          keys = [
-              "LOGS_DIR",
-              "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
-              "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
-              "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
-              "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
-              "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
-          ]
-          for k in keys:
-              v = os.environ.get(k, "")
-              print(f"{k}: len={len(v)} sha256_12={short_hash(v) if v else 'EMPTY'} startswith_/={v.startswith('/') if v else False}")
-
-          print("== secrets present? (length only) ==")
-          for k in ["OPENAI_API_KEY","DROPBOX_REFRESH_TOKEN","DROPBOX_APP_KEY","DROPBOX_APP_SECRET","STATE_PATH"]:
-              v = os.environ.get(k, "")
-              print(f"{k}: len={len(v)}")
+          def h(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12] if s else "EMPTY"
+          for k in [
+            "LOGS_DIR","STATE_PATH",
+            "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
+            "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
+            "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
+            "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
+            "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
+          ]:
+            v = os.environ.get(k,"")
+            print(f"{k}: len={len(v)} sha256_12={h(v)} startswith_/={v.startswith('/') if v else False}")
           PY
 
-      # ---- Dropbox debug: account + stage00 IN/OUT/DONE + state.json existence ----
-      - name: Dropbox debug (stage00 IN/OUT/DONE + state.json)
-        shell: bash
-        env:
-          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
-          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-          STATE_PATH: ${{ secrets.STATE_PATH }}
-
-          STAGE00_IN: ${{ vars.STAGE00_IN }}
-          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
-          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          import os, json, hashlib
-          import dropbox
-          from dropbox.exceptions import ApiError
-
-          tok = os.environ["DROPBOX_REFRESH_TOKEN"]
-          app_key = os.environ["DROPBOX_APP_KEY"]
-          app_secret = os.environ["DROPBOX_APP_SECRET"]
-
-          state_path = os.environ.get("STATE_PATH", "")
-          p_in = os.environ["STAGE00_IN"]
-          p_out = os.environ["STAGE00_OUT"]
-          p_done = os.environ["STAGE00_DONE"]
-
-          def short_hash(s: str) -> str:
-              return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
-
-          dbx = dropbox.Dropbox(oauth2_refresh_token=tok, app_key=app_key, app_secret=app_secret)
-
-          # Account
-          try:
-              acc = dbx.users_get_current_account()
-              print("== current_account ==")
-              print("account_id:", acc.account_id)
-              print("name:", acc.name.display_name)
-              print("email:", acc.email)
-          except Exception as e:
-              print("ERROR current_account:", repr(e))
-
-          def list_folder(path: str, limit: int = 50):
-              print(f"\n== list_folder: {path!r} ==")
-              try:
-                  res = dbx.files_list_folder(path)
-              except ApiError as e:
-                  print("ERROR list_folder:", e)
-                  return
-              entries = res.entries
-              print("count:", len(entries))
-              for e in entries[:limit]:
-                  t = type(e).__name__
-                  pd = getattr(e, "path_display", "")
-                  sz = getattr(e, "size", "")
-                  print(t, pd, sz)
-
-          # Stage00 IN/OUT/DONE
-          list_folder(p_in)
-          list_folder(p_out)
-          list_folder(p_done)
-
-          # Search by name (safe)
-          target = "今月の振り返り１６.xlsx"
-          print(f"\n== search by name: {target} ==")
-          try:
-              sr = dbx.files_search_v2(query=target)
-              matches = sr.matches or []
-              print("matches:", len(matches))
-              for m in matches[:50]:
-                  md = m.metadata.get_metadata()
-                  print(getattr(md, "path_display", ""))
-          except ApiError as e:
-              print("ERROR search:", e)
-
-          # State file existence + minimal schema info (no full dump)
-          print(f"\n== state_path check: len={len(state_path)} sha256_12={short_hash(state_path) if state_path else 'EMPTY'} ==")
-          if not state_path:
-              print("STATE_PATH is EMPTY (this alone can explain 'no progress').")
-          else:
-              try:
-                  md = dbx.files_get_metadata(state_path)
-                  print("state exists:", getattr(md, "path_display", ""), "size:", getattr(md, "size", ""))
-                  _, resp = dbx.files_download(state_path)
-                  raw = resp.content
-                  print("state download bytes:", len(raw))
-                  try:
-                      obj = json.loads(raw.decode("utf-8"))
-                      if isinstance(obj, dict):
-                          print("state json keys:", sorted(list(obj.keys()))[:50])
-                          for k in ["processed", "done", "files", "history", "items"]:
-                              if k in obj and isinstance(obj[k], (list, dict)):
-                                  print(f"state[{k}] type={type(obj[k]).__name__} len={len(obj[k])}")
-                      else:
-                          print("state json is not dict:", type(obj).__name__)
-                  except Exception as e:
-                      print("state json parse error:", repr(e))
-              except ApiError as e:
-                  print("state metadata error:", e)
-          PY
-
-      # ---- Preflight: fail fast before touching pipeline logic ----
       - name: Preflight (compile + import)
         shell: bash
         run: |
@@ -199,18 +80,17 @@ jobs:
           python -m compileall -q src
           python -c "import src.monthly_main; print('import ok')"
 
-      - name: Run pipeline (debug wrapper)
+      - name: Run pipeline
         shell: bash
         env:
-          # Secrets
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-          STATE_PATH: ${{ secrets.STATE_PATH }}
 
-          # Repo variables (plain text)
           LOGS_DIR: ${{ vars.LOGS_DIR }}
+          STATE_PATH: ${{ vars.STATE_PATH }}
+
           STAGE00_IN: ${{ vars.STAGE00_IN }}
           STAGE00_OUT: ${{ vars.STAGE00_OUT }}
           STAGE00_DONE: ${{ vars.STAGE00_DONE }}
@@ -227,7 +107,6 @@ jobs:
           STAGE40_OUT: ${{ vars.STAGE40_OUT }}
           STAGE40_DONE: ${{ vars.STAGE40_DONE }}
 
-          # Controls
           MONTHLY_STAGE: ${{ inputs.monthly_stage }}
           OPENAI_MODEL: gpt-5-mini
           DEPTH: medium
@@ -240,15 +119,4 @@ jobs:
         run: |
           set -euxo pipefail
           python -V
-          python - <<'PY'
-          import runpy, sys, traceback
-          try:
-              runpy.run_module("src.monthly_main", run_name="__main__")
-          except SystemExit as e:
-              print(f"[wrapper] SystemExit: code={e.code!r}", file=sys.stderr)
-              raise
-          except Exception:
-              print("[wrapper] Unhandled exception:", file=sys.stderr)
-              traceback.print_exc()
-              sys.exit(1)
-          PY
+          python -m src.monthly_main
