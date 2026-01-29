@@ -3,7 +3,6 @@ name: inbox-bot (monthly)
 on:
   workflow_dispatch:
   schedule:
-    # 22分おき（必要に応じて調整）
     - cron: "*/22 * * * *"
 
 concurrency:
@@ -13,6 +12,48 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    # ★ここで secrets を env に落としておく（if では env を参照する）
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+
+      STATE_PATH: ${{ secrets.STATE_PATH }}
+      LOGS_DIR: ${{ secrets.LOGS_DIR }}
+
+      STAGE00_IN: ${{ secrets.STAGE00_IN }}
+      STAGE00_OUT: ${{ secrets.STAGE00_OUT }}
+      STAGE00_DONE: ${{ secrets.STAGE00_DONE }}
+
+      STAGE10_IN: ${{ secrets.STAGE10_IN }}
+      STAGE10_OUT: ${{ secrets.STAGE10_OUT }}
+      STAGE10_DONE: ${{ secrets.STAGE10_DONE }}
+
+      STAGE20_IN: ${{ secrets.STAGE20_IN }}
+      STAGE20_OUT: ${{ secrets.STAGE20_OUT }}
+      STAGE20_DONE: ${{ secrets.STAGE20_DONE }}
+
+      STAGE30_IN: ${{ secrets.STAGE30_IN }}
+      STAGE30_OUT: ${{ secrets.STAGE30_OUT }}
+      STAGE30_DONE: ${{ secrets.STAGE30_DONE }}
+
+      STAGE40_IN: ${{ secrets.STAGE40_IN }}
+      STAGE40_OUT: ${{ secrets.STAGE40_OUT }}
+      STAGE40_DONE: ${{ secrets.STAGE40_DONE }}
+
+      MONTHLY_STAGE: ${{ secrets.MONTHLY_STAGE }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+      DEPTH: ${{ secrets.DEPTH }}
+      OPENAI_TIMEOUT: ${{ secrets.OPENAI_TIMEOUT }}
+      OPENAI_MAX_RETRIES: ${{ secrets.OPENAI_MAX_RETRIES }}
+      OPENAI_MAX_OUTPUT_TOKENS: ${{ secrets.OPENAI_MAX_OUTPUT_TOKENS }}
+      MAX_FILES_PER_RUN: ${{ secrets.MAX_FILES_PER_RUN }}
+      MAX_INPUT_CHARS: ${{ secrets.MAX_INPUT_CHARS }}
+
+      PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,41 +72,19 @@ jobs:
 
       - name: Debug env (length only)
         shell: bash
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
-          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-          STATE_PATH: ${{ secrets.STATE_PATH }}
-          LOGS_DIR: ${{ secrets.LOGS_DIR }}
-          STAGE00_IN: ${{ secrets.STAGE00_IN }}
-          STAGE00_OUT: ${{ secrets.STAGE00_OUT }}
-          STAGE00_DONE: ${{ secrets.STAGE00_DONE }}
-          STAGE10_IN: ${{ secrets.STAGE10_IN }}
-          STAGE10_OUT: ${{ secrets.STAGE10_OUT }}
-          STAGE10_DONE: ${{ secrets.STAGE10_DONE }}
-          STAGE20_IN: ${{ secrets.STAGE20_IN }}
-          STAGE20_OUT: ${{ secrets.STAGE20_OUT }}
-          STAGE20_DONE: ${{ secrets.STAGE20_DONE }}
-          STAGE30_IN: ${{ secrets.STAGE30_IN }}
-          STAGE30_OUT: ${{ secrets.STAGE30_OUT }}
-          STAGE30_DONE: ${{ secrets.STAGE30_DONE }}
-          STAGE40_IN: ${{ secrets.STAGE40_IN }}
-          STAGE40_OUT: ${{ secrets.STAGE40_OUT }}
-          STAGE40_DONE: ${{ secrets.STAGE40_DONE }}
         run: |
           set -euxo pipefail
           python - <<'PY'
           import os, hashlib
-          know = [
-            "LOGS_DIR","STATE_PATH",
+          keys = [
+            "LOGS_DIR","STATE_PATH","MONTHLY_STAGE",
             "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
             "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
             "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
             "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
             "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
           ]
-          for k in know:
+          for k in keys:
             v = os.environ.get(k,"")
             if v:
               h = hashlib.sha256(v.encode()).hexdigest()[:12]
@@ -80,38 +99,6 @@ jobs:
 
       - name: Run monthly_main
         shell: bash
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
-          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-          STATE_PATH: ${{ secrets.STATE_PATH }}
-          LOGS_DIR: ${{ secrets.LOGS_DIR }}
-          STAGE00_IN: ${{ secrets.STAGE00_IN }}
-          STAGE00_OUT: ${{ secrets.STAGE00_OUT }}
-          STAGE00_DONE: ${{ secrets.STAGE00_DONE }}
-          STAGE10_IN: ${{ secrets.STAGE10_IN }}
-          STAGE10_OUT: ${{ secrets.STAGE10_OUT }}
-          STAGE10_DONE: ${{ secrets.STAGE10_DONE }}
-          STAGE20_IN: ${{ secrets.STAGE20_IN }}
-          STAGE20_OUT: ${{ secrets.STAGE20_OUT }}
-          STAGE20_DONE: ${{ secrets.STAGE20_DONE }}
-          STAGE30_IN: ${{ secrets.STAGE30_IN }}
-          STAGE30_OUT: ${{ secrets.STAGE30_OUT }}
-          STAGE30_DONE: ${{ secrets.STAGE30_DONE }}
-          STAGE40_IN: ${{ secrets.STAGE40_IN }}
-          STAGE40_OUT: ${{ secrets.STAGE40_OUT }}
-          STAGE40_DONE: ${{ secrets.STAGE40_DONE }}
-          # 実行ステージは workflow_dispatch か Repository Secrets の MONTHLY_STAGE を使う想定
-          MONTHLY_STAGE: ${{ secrets.MONTHLY_STAGE }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          DEPTH: ${{ secrets.DEPTH }}
-          OPENAI_TIMEOUT: ${{ secrets.OPENAI_TIMEOUT }}
-          OPENAI_MAX_RETRIES: ${{ secrets.OPENAI_MAX_RETRIES }}
-          OPENAI_MAX_OUTPUT_TOKENS: ${{ secrets.OPENAI_MAX_OUTPUT_TOKENS }}
-          MAX_FILES_PER_RUN: ${{ secrets.MAX_FILES_PER_RUN }}
-          MAX_INPUT_CHARS: ${{ secrets.MAX_INPUT_CHARS }}
-          PYTHONUNBUFFERED: "1"
         run: |
           set -euxo pipefail
           python -V
@@ -134,15 +121,10 @@ jobs:
             print(f"[wrapper] END (elapsed_s={time.time()-t0:.2f})")
           PY
 
-      # ★おすすめ：stage40 完走後に Dropboxへ “_DONE_YYYY-MM.txt” を add（上書きなし）
+      # ★ここが修正点：secrets ではなく env を見る
       - name: Write DONE marker to stage40/OUT (no overwrite)
-        if: ${{ secrets.MONTHLY_STAGE == '40' }}
+        if: ${{ env.MONTHLY_STAGE == '40' }}
         shell: bash
-        env:
-          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
-          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
-          STAGE40_OUT: ${{ secrets.STAGE40_OUT }}
         run: |
           set -euxo pipefail
           python - <<'PY'
@@ -172,8 +154,8 @@ jobs:
             res = dbx.files_upload(
               body.encode("utf-8"),
               path,
-              mode=WriteMode.add,     # ★上書きしない
-              autorename=True,        # 同名なら Dropbox が別名にする
+              mode=WriteMode.add,   # 上書きしない
+              autorename=True,      # 同名は別名化
               mute=True,
             )
             print("uploaded:", res.path_display)
