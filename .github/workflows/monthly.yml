@@ -35,11 +35,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Sanity check Dropbox vars (safe)
+      # ---- Sanity check (no secret leak): show only lengths/hashes ----
+      - name: Sanity check env (no secret leak)
         shell: bash
         env:
+          # Repo variables (plain text)
           LOGS_DIR: ${{ vars.LOGS_DIR }}
-          STATE_PATH: ${{ vars.STATE_PATH }}
           STAGE00_IN: ${{ vars.STAGE00_IN }}
           STAGE00_OUT: ${{ vars.STAGE00_OUT }}
           STAGE00_DONE: ${{ vars.STAGE00_DONE }}
@@ -55,23 +56,39 @@ jobs:
           STAGE40_IN: ${{ vars.STAGE40_IN }}
           STAGE40_OUT: ${{ vars.STAGE40_OUT }}
           STAGE40_DONE: ${{ vars.STAGE40_DONE }}
+
+          # Secrets (masked)
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          STATE_PATH: ${{ secrets.STATE_PATH }}
         run: |
           set -euxo pipefail
           python - <<'PY'
           import os, hashlib
-          def h(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12] if s else "EMPTY"
-          for k in [
-            "LOGS_DIR","STATE_PATH",
-            "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
-            "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
-            "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
-            "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
-            "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
-          ]:
-            v = os.environ.get(k,"")
-            print(f"{k}: len={len(v)} sha256_12={h(v)} startswith_/={v.startswith('/') if v else False}")
+          def short_hash(s: str) -> str:
+              return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+          keys = [
+              "LOGS_DIR",
+              "STATE_PATH",
+              "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
+              "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
+              "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
+              "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
+              "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
+          ]
+          for k in keys:
+              v = os.environ.get(k, "")
+              print(f"{k}: len={len(v)} sha256_12={short_hash(v) if v else 'EMPTY'} startswith_/={v.startswith('/') if v else False}")
+
+          # hard fail if STATE_PATH is empty
+          if not os.environ.get("STATE_PATH",""):
+              raise SystemExit("FATAL: STATE_PATH is EMPTY. Set Actions Secret STATE_PATH to something like '/_system/state.json'.")
           PY
 
+      # ---- Preflight ----
       - name: Preflight (compile + import)
         shell: bash
         run: |
@@ -83,14 +100,15 @@ jobs:
       - name: Run pipeline
         shell: bash
         env:
+          # Secrets
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          STATE_PATH: ${{ secrets.STATE_PATH }}
 
+          # Repo variables (plain text)
           LOGS_DIR: ${{ vars.LOGS_DIR }}
-          STATE_PATH: ${{ vars.STATE_PATH }}
-
           STAGE00_IN: ${{ vars.STAGE00_IN }}
           STAGE00_OUT: ${{ vars.STAGE00_OUT }}
           STAGE00_DONE: ${{ vars.STAGE00_DONE }}
@@ -107,6 +125,7 @@ jobs:
           STAGE40_OUT: ${{ vars.STAGE40_OUT }}
           STAGE40_DONE: ${{ vars.STAGE40_DONE }}
 
+          # Controls
           MONTHLY_STAGE: ${{ inputs.monthly_stage }}
           OPENAI_MODEL: gpt-5-mini
           DEPTH: medium
@@ -119,4 +138,4 @@ jobs:
         run: |
           set -euxo pipefail
           python -V
-          python -m src.monthly_main
+          python -m src.monthly_mainb
