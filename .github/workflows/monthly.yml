@@ -2,7 +2,21 @@ name: inbox-bot (monthly)
 
 on:
   workflow_dispatch:
+    inputs:
+      monthly_stage:
+        description: "Stage to run: 00/10/20/30/40"
+        required: false
+        default: "00"
+      depth:
+        description: "Depth: light/medium/heavy"
+        required: false
+        default: "medium"
+      max_files_per_run:
+        description: "Max files per run"
+        required: false
+        default: "200"
   schedule:
+    # 必要に応じて調整（例：22分おき）
     - cron: "*/22 * * * *"
 
 concurrency:
@@ -14,44 +28,47 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # --- Secrets ---
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
 
-      STATE_PATH: ${{ secrets.STATE_PATH }}
-      LOGS_DIR: ${{ secrets.LOGS_DIR }}
+      # --- Repo Variables (paths / config) ---
+      STATE_PATH: ${{ vars.STATE_PATH }}
+      LOGS_DIR: ${{ vars.LOGS_DIR }}
 
-      STAGE00_IN: ${{ secrets.STAGE00_IN }}
-      STAGE00_OUT: ${{ secrets.STAGE00_OUT }}
-      STAGE00_DONE: ${{ secrets.STAGE00_DONE }}
+      STAGE00_IN: ${{ vars.STAGE00_IN }}
+      STAGE00_OUT: ${{ vars.STAGE00_OUT }}
+      STAGE00_DONE: ${{ vars.STAGE00_DONE }}
 
-      STAGE10_IN: ${{ secrets.STAGE10_IN }}
-      STAGE10_OUT: ${{ secrets.STAGE10_OUT }}
-      STAGE10_DONE: ${{ secrets.STAGE10_DONE }}
+      STAGE10_IN: ${{ vars.STAGE10_IN }}
+      STAGE10_OUT: ${{ vars.STAGE10_OUT }}
+      STAGE10_DONE: ${{ vars.STAGE10_DONE }}
 
-      STAGE20_IN: ${{ secrets.STAGE20_IN }}
-      STAGE20_OUT: ${{ secrets.STAGE20_OUT }}
-      STAGE20_DONE: ${{ secrets.STAGE20_DONE }}
+      STAGE20_IN: ${{ vars.STAGE20_IN }}
+      STAGE20_OUT: ${{ vars.STAGE20_OUT }}
+      STAGE20_DONE: ${{ vars.STAGE20_DONE }}
 
-      STAGE30_IN: ${{ secrets.STAGE30_IN }}
-      STAGE30_OUT: ${{ secrets.STAGE30_OUT }}
-      STAGE30_DONE: ${{ secrets.STAGE30_DONE }}
+      STAGE30_IN: ${{ vars.STAGE30_IN }}
+      STAGE30_OUT: ${{ vars.STAGE30_OUT }}
+      STAGE30_DONE: ${{ vars.STAGE30_DONE }}
 
-      STAGE40_IN: ${{ secrets.STAGE40_IN }}
-      STAGE40_OUT: ${{ secrets.STAGE40_OUT }}
-      STAGE40_DONE: ${{ secrets.STAGE40_DONE }}
+      STAGE40_IN: ${{ vars.STAGE40_IN }}
+      STAGE40_OUT: ${{ vars.STAGE40_OUT }}
+      STAGE40_DONE: ${{ vars.STAGE40_DONE }}
 
-      # ★空なら 00 に倒す（ここが今回のエラー対策）
-      MONTHLY_STAGE: ${{ secrets.MONTHLY_STAGE || '00' }}
+      # --- Runtime knobs (prefer workflow_dispatch inputs, fallback vars, then defaults) ---
+      MONTHLY_STAGE: ${{ inputs.monthly_stage != '' && inputs.monthly_stage || vars.MONTHLY_STAGE != '' && vars.MONTHLY_STAGE || '00' }}
+      DEPTH: ${{ inputs.depth != '' && inputs.depth || vars.DEPTH != '' && vars.DEPTH || 'medium' }}
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL != '' && vars.OPENAI_MODEL || 'gpt-5-mini' }}
 
-      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-5-mini' }}
-      DEPTH: ${{ secrets.DEPTH || 'medium' }}
-      OPENAI_TIMEOUT: ${{ secrets.OPENAI_TIMEOUT || '120' }}
-      OPENAI_MAX_RETRIES: ${{ secrets.OPENAI_MAX_RETRIES || '2' }}
-      OPENAI_MAX_OUTPUT_TOKENS: ${{ secrets.OPENAI_MAX_OUTPUT_TOKENS || '5000' }}
-      MAX_FILES_PER_RUN: ${{ secrets.MAX_FILES_PER_RUN || '200' }}
-      MAX_INPUT_CHARS: ${{ secrets.MAX_INPUT_CHARS || '80000' }}
+      OPENAI_TIMEOUT: ${{ vars.OPENAI_TIMEOUT != '' && vars.OPENAI_TIMEOUT || '120' }}
+      OPENAI_MAX_RETRIES: ${{ vars.OPENAI_MAX_RETRIES != '' && vars.OPENAI_MAX_RETRIES || '2' }}
+      OPENAI_MAX_OUTPUT_TOKENS: ${{ vars.OPENAI_MAX_OUTPUT_TOKENS != '' && vars.OPENAI_MAX_OUTPUT_TOKENS || '5000' }}
+
+      MAX_FILES_PER_RUN: ${{ inputs.max_files_per_run != '' && inputs.max_files_per_run || vars.MAX_FILES_PER_RUN != '' && vars.MAX_FILES_PER_RUN || '200' }}
+      MAX_INPUT_CHARS: ${{ vars.MAX_INPUT_CHARS != '' && vars.MAX_INPUT_CHARS || '80000' }}
 
       PYTHONUNBUFFERED: "1"
 
@@ -64,48 +81,55 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ★安全装置：ステージに必要な Dropbox パスが空なら落とす
-      - name: Guard: required env for selected stage
+      # 安全なサニティチェック（秘密は出さない：長さとsha256先頭のみ）
+      - name: Sanity check Dropbox vars (safe)
         shell: bash
         run: |
           set -euxo pipefail
           python - <<'PY'
-          import os, sys
-
-          stage = (os.environ.get("MONTHLY_STAGE","") or "").strip()
-          if stage not in {"00","10","20","30","40"}:
-            raise SystemExit(f"MONTHLY_STAGE invalid: {stage!r}")
-
-          def need(k: str):
-            v = (os.environ.get(k,"") or "").strip()
-            if not v:
-              raise SystemExit(f"Missing required env: {k}")
-            if not v.startswith("/"):
-              raise SystemExit(f"Invalid path (must start with '/'): {k}={v!r}")
-
-          need(f"STAGE{stage}_IN")
-          need(f"STAGE{stage}_OUT")
-          need(f"STAGE{stage}_DONE")
-
-          # logs/state は任意だが、使う設計ならここで必須にしてもOK
-          # (今回は過去運用に合わせて任意のまま)
-          print("Guard OK. stage=", stage)
+          import os, hashlib
+          keys = [
+            "LOGS_DIR","STATE_PATH",
+            "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
+            "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
+            "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
+            "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
+            "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
+            "MONTHLY_STAGE","OPENAI_MODEL","DEPTH",
+            "OPENAI_TIMEOUT","OPENAI_MAX_RETRIES","OPENAI_MAX_OUTPUT_TOKENS",
+            "MAX_FILES_PER_RUN","MAX_INPUT_CHARS",
+          ]
+          for k in keys:
+            v = os.environ.get(k,"") or ""
+            h = hashlib.sha256(v.encode("utf-8")).hexdigest()[:12] if v else ""
+            print(f"{k}: len={len(v)} sha256_12={h} startswith_/={v.startswith('/') if v else False}")
+          print("== secrets present? (length only) ==")
+          for k in ["OPENAI_API_KEY","DROPBOX_REFRESH_TOKEN","DROPBOX_APP_KEY","DROPBOX_APP_SECRET"]:
+            v = os.environ.get(k,"") or ""
+            print(f"{k}: len={len(v)}")
           PY
 
-      - name: Run monthly_main
+      - name: Compile + import check
         shell: bash
         run: |
           set -euxo pipefail
           python -V
           python -m compileall -q src
           python -c "import src.monthly_main; print('import ok')"
+
+      # ここが本体：runpy wrapper（失敗時のログを綺麗に出す）
+      - name: Run monthly pipeline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -V
           python - <<'PY'
           import runpy, sys, time, traceback
           t0 = time.time()
@@ -123,35 +147,85 @@ jobs:
             print(f"[wrapper] END (elapsed_s={time.time()-t0:.2f})")
           PY
 
-      - name: Write DONE marker to stage40/OUT (no overwrite)
-        if: ${{ env.MONTHLY_STAGE == '40' }}
+      # 実行後の確認（DropboxのIN/OUT/DONEと最新ログ末尾）
+      - name: Post-run: list stage folders + tail latest log (safe-ish)
+        if: ${{ always() }}
         shell: bash
         run: |
           set -euxo pipefail
           python - <<'PY'
           import os
-          from datetime import datetime, timezone
           import dropbox
-          from dropbox.files import WriteMode
+          from dropbox.exceptions import ApiError
 
           tok = os.environ["DROPBOX_REFRESH_TOKEN"]
           app_key = os.environ["DROPBOX_APP_KEY"]
           app_secret = os.environ["DROPBOX_APP_SECRET"]
-          out_dir = (os.environ.get("STAGE40_OUT","") or "").rstrip("/")
+          logs_dir = os.environ.get("LOGS_DIR","") or ""
+          stage = (os.environ.get("MONTHLY_STAGE","00") or "00").strip()
 
-          now = datetime.now(timezone.utc)
-          ym = now.strftime("%Y-%m")
-          fname = f"_DONE_{ym}.txt"
-          body = f"{ym} monthly pipeline finished (stage40)\n"
-          path = f"{out_dir}/{fname}"
+          def pick(stage: str, kind: str) -> str:
+              key = f"STAGE{stage}_{kind}"
+              return os.environ.get(key, "") or ""
+
+          p_in = pick(stage, "IN")
+          p_out = pick(stage, "OUT")
+          p_done = pick(stage, "DONE")
 
           dbx = dropbox.Dropbox(oauth2_refresh_token=tok, app_key=app_key, app_secret=app_secret)
-          res = dbx.files_upload(
-            body.encode("utf-8"),
-            path,
-            mode=WriteMode.add,
-            autorename=True,
-            mute=True,
-          )
-          print("uploaded:", res.path_display)
+
+          def list_folder(path: str, limit: int = 200):
+              print(f"\n== list_folder: {path!r} ==")
+              if not path:
+                  print("EMPTY path")
+                  return
+              try:
+                  res = dbx.files_list_folder(path)
+              except ApiError as e:
+                  print("ERROR list_folder:", e)
+                  return
+              entries = res.entries
+              print("count:", len(entries))
+              for e in entries[:limit]:
+                  t = type(e).__name__
+                  pd = getattr(e, "path_display", "")
+                  sz = getattr(e, "size", "")
+                  print(t, pd, sz)
+
+          print("== stage ==", stage)
+          list_folder(p_in)
+          list_folder(p_out)
+          list_folder(p_done)
+
+          print(f"\n== tail latest log: logs_dir={logs_dir!r} ==")
+          if not logs_dir:
+              print("LOGS_DIR empty")
+              raise SystemExit(0)
+
+          try:
+              res = dbx.files_list_folder(logs_dir)
+              folders = [e for e in res.entries if type(e).__name__ == "FolderMetadata"]
+              if not folders:
+                  print("no log folders found")
+                  raise SystemExit(0)
+              latest_folder = sorted(folders, key=lambda x: x.name)[-1].path_display
+              print("latest_folder:", latest_folder)
+
+              res2 = dbx.files_list_folder(latest_folder)
+              files = [e for e in res2.entries if type(e).__name__ == "FileMetadata"]
+              if not files:
+                  print("no log files in latest folder")
+                  raise SystemExit(0)
+              latest = sorted(files, key=lambda x: x.server_modified)[-1]
+              latest_file = latest.path_display
+              print("latest_file:", latest_file, "size:", latest.size)
+
+              _, resp = dbx.files_download(latest_file)
+              raw = resp.content.decode("utf-8", errors="replace")
+              tail = raw[-3000:]
+              print("\n----- LOG TAIL (last ~3000 chars) -----\n")
+              print(tail)
+              print("\n----- END LOG TAIL -----\n")
+          except ApiError as e:
+              print("log tail error:", e)
           PY
