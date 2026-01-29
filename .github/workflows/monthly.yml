@@ -13,7 +13,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # ★ここで secrets を env に落としておく（if では env を参照する）
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
@@ -43,14 +42,16 @@ jobs:
       STAGE40_OUT: ${{ secrets.STAGE40_OUT }}
       STAGE40_DONE: ${{ secrets.STAGE40_DONE }}
 
-      MONTHLY_STAGE: ${{ secrets.MONTHLY_STAGE }}
-      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-      DEPTH: ${{ secrets.DEPTH }}
-      OPENAI_TIMEOUT: ${{ secrets.OPENAI_TIMEOUT }}
-      OPENAI_MAX_RETRIES: ${{ secrets.OPENAI_MAX_RETRIES }}
-      OPENAI_MAX_OUTPUT_TOKENS: ${{ secrets.OPENAI_MAX_OUTPUT_TOKENS }}
-      MAX_FILES_PER_RUN: ${{ secrets.MAX_FILES_PER_RUN }}
-      MAX_INPUT_CHARS: ${{ secrets.MAX_INPUT_CHARS }}
+      # ★空なら 00 に倒す（ここが今回のエラー対策）
+      MONTHLY_STAGE: ${{ secrets.MONTHLY_STAGE || '00' }}
+
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-5-mini' }}
+      DEPTH: ${{ secrets.DEPTH || 'medium' }}
+      OPENAI_TIMEOUT: ${{ secrets.OPENAI_TIMEOUT || '120' }}
+      OPENAI_MAX_RETRIES: ${{ secrets.OPENAI_MAX_RETRIES || '2' }}
+      OPENAI_MAX_OUTPUT_TOKENS: ${{ secrets.OPENAI_MAX_OUTPUT_TOKENS || '5000' }}
+      MAX_FILES_PER_RUN: ${{ secrets.MAX_FILES_PER_RUN || '200' }}
+      MAX_INPUT_CHARS: ${{ secrets.MAX_INPUT_CHARS || '80000' }}
 
       PYTHONUNBUFFERED: "1"
 
@@ -70,31 +71,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug env (length only)
+      # ★安全装置：ステージに必要な Dropbox パスが空なら落とす
+      - name: Guard: required env for selected stage
         shell: bash
         run: |
           set -euxo pipefail
           python - <<'PY'
-          import os, hashlib
-          keys = [
-            "LOGS_DIR","STATE_PATH","MONTHLY_STAGE",
-            "STAGE00_IN","STAGE00_OUT","STAGE00_DONE",
-            "STAGE10_IN","STAGE10_OUT","STAGE10_DONE",
-            "STAGE20_IN","STAGE20_OUT","STAGE20_DONE",
-            "STAGE30_IN","STAGE30_OUT","STAGE30_DONE",
-            "STAGE40_IN","STAGE40_OUT","STAGE40_DONE",
-          ]
-          for k in keys:
-            v = os.environ.get(k,"")
-            if v:
-              h = hashlib.sha256(v.encode()).hexdigest()[:12]
-              print(f"{k}: len={len(v)} sha256_12={h} startswith_/={v.startswith('/')}")
-            else:
-              print(f"{k}: len=0 sha256_12=EMPTY startswith_/=False")
-          print("== secrets present? (length only) ==")
-          for k in ["OPENAI_API_KEY","DROPBOX_REFRESH_TOKEN","DROPBOX_APP_KEY","DROPBOX_APP_SECRET"]:
-            v = os.environ.get(k,"")
-            print(f"{k}: len={len(v)}")
+          import os, sys
+
+          stage = (os.environ.get("MONTHLY_STAGE","") or "").strip()
+          if stage not in {"00","10","20","30","40"}:
+            raise SystemExit(f"MONTHLY_STAGE invalid: {stage!r}")
+
+          def need(k: str):
+            v = (os.environ.get(k,"") or "").strip()
+            if not v:
+              raise SystemExit(f"Missing required env: {k}")
+            if not v.startswith("/"):
+              raise SystemExit(f"Invalid path (must start with '/'): {k}={v!r}")
+
+          need(f"STAGE{stage}_IN")
+          need(f"STAGE{stage}_OUT")
+          need(f"STAGE{stage}_DONE")
+
+          # logs/state は任意だが、使う設計ならここで必須にしてもOK
+          # (今回は過去運用に合わせて任意のまま)
+          print("Guard OK. stage=", stage)
           PY
 
       - name: Run monthly_main
@@ -121,7 +123,6 @@ jobs:
             print(f"[wrapper] END (elapsed_s={time.time()-t0:.2f})")
           PY
 
-      # ★ここが修正点：secrets ではなく env を見る
       - name: Write DONE marker to stage40/OUT (no overwrite)
         if: ${{ env.MONTHLY_STAGE == '40' }}
         shell: bash
@@ -132,15 +133,11 @@ jobs:
           from datetime import datetime, timezone
           import dropbox
           from dropbox.files import WriteMode
-          from dropbox.exceptions import ApiError
 
           tok = os.environ["DROPBOX_REFRESH_TOKEN"]
           app_key = os.environ["DROPBOX_APP_KEY"]
           app_secret = os.environ["DROPBOX_APP_SECRET"]
           out_dir = (os.environ.get("STAGE40_OUT","") or "").rstrip("/")
-
-          if not out_dir.startswith("/"):
-            raise SystemExit(f"STAGE40_OUT is invalid: {out_dir!r}")
 
           now = datetime.now(timezone.utc)
           ym = now.strftime("%Y-%m")
@@ -149,17 +146,12 @@ jobs:
           path = f"{out_dir}/{fname}"
 
           dbx = dropbox.Dropbox(oauth2_refresh_token=tok, app_key=app_key, app_secret=app_secret)
-
-          try:
-            res = dbx.files_upload(
-              body.encode("utf-8"),
-              path,
-              mode=WriteMode.add,   # 上書きしない
-              autorename=True,      # 同名は別名化
-              mute=True,
-            )
-            print("uploaded:", res.path_display)
-          except ApiError as e:
-            print("ERROR uploading marker:", e)
-            raise
+          res = dbx.files_upload(
+            body.encode("utf-8"),
+            path,
+            mode=WriteMode.add,
+            autorename=True,
+            mute=True,
+          )
+          print("uploaded:", res.path_display)
           PY
