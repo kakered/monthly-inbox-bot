@@ -1,170 +1,110 @@
 # -*- coding: utf-8 -*-
-from __future__ import annotations
 
 import os
+import sys
+import json
 import time
-from typing import Dict, List, Tuple
+import openpyxl
+from openai import OpenAI
 
-from .dropbox_io import DropboxIO, DbxEntry
-from .state_store import StateStore
-from .logger import JsonlLogger
-
-
-def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
-def _utc_stamp() -> str:
-    return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+# =========================
+# API PROMPTS
+# =========================
+
+PROMPT_V = """あなたは、対象者と同じ職場で日常的に業務を見ている立場の、
+落ち着いた現場の先輩です。
+
+以下の月報全文を読み、
+実際の月報フィードバック担当者が
+要点を絞って、少し丁寧に書いたような
+自然な月報草案を作成してください。
+
+【制約】
+- 敬体（です・ます）で書く
+- 全体で5〜8行
+- 肯定を中心にする
+- 改善点に触れる場合は最大1点まで
+- 原文に書かれていない事実や評価を追加しない
+- 性格・能力への断定はしない
+- 説教調にしない
+
+【入力（月報全文）】
+{TEXT}
+"""
+
+PROMPT_W = """以下の月報全文をもとに、
+業務状況を第三者に共有するための
+簡潔な要約報告を作成してください。
+
+【制約】
+- 2〜3行
+- 事実ベースで記述する
+- 評価・指導・感情表現は控える
+- 特定の宛先（部署名・役職名など）は書かない
+- 敬体（です・ます）で書く
+
+【入力（月報全文）】
+{TEXT}
+"""
 
 
-def _stage_vars(stage: str) -> Tuple[str, str, str]:
-    return (
-        _env(f"STAGE{stage}_IN"),
-        _env(f"STAGE{stage}_OUT"),
-        _env(f"STAGE{stage}_DONE"),
+def call_api(prompt: str) -> str:
+    res = client.responses.create(
+        model=os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
+        input=prompt,
+        max_output_tokens=int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "2000")),
+        timeout=int(os.environ.get("OPENAI_TIMEOUT", "120")),
     )
+    return res.output_text.strip()
 
 
-def _next_stage(stage: str) -> str:
-    order = ["00", "10", "20", "30", "40"]
-    i = order.index(stage)
-    return order[i + 1] if i + 1 < len(order) else ""
+# =========================
+# STAGE 20
+# =========================
 
+def run_stage20(xlsx_path: str, out_path: str):
+    wb = openpyxl.load_workbook(xlsx_path)
+    ws = wb.active
 
-def _is_xlsx(name: str) -> bool:
-    n = name.lower()
-    return n.endswith(".xlsx") or n.endswith(".xlsm")
+    # 列定義（固定）
+    COL_G = "G"  # 人間関係
+    COL_I = "I"  # 積極性
+    COL_K = "K"  # ヒヤリハット
+    COL_M = "M"  # 本社相談
 
+    COL_U = "U"  # 月報全文
+    COL_V = "V"  # 月報草案
+    COL_W = "W"  # 要約報告
 
-def _file_key(e: DbxEntry) -> str:
-    # stable-ish: path + rev if present
-    if e.rev:
-        return f"{e.path}@{e.rev}"
-    return e.path
+    for row in range(2, ws.max_row + 1):
+        g = ws[f"{COL_G}{row}"].value or ""
+        i = ws[f"{COL_I}{row}"].value or ""
+        k = ws[f"{COL_K}{row}"].value or ""
+        m = ws[f"{COL_M}{row}"].value or ""
 
+        full_text = "\n".join([g, i, k, m]).strip()
+        ws[f"{COL_U}{row}"] = full_text
 
-def stage_copy_forward(
-    *,
-    io: DropboxIO,
-    logger: JsonlLogger,
-    store: StateStore,
-    stage: str,
-    max_files: int,
-) -> int:
-    """
-    Minimal robust behavior:
-    - Read files from STAGEXX_IN
-    - Copy bytes to STAGEXX_OUT with a stage-tagged filename
-    - Move original to STAGEXX_DONE with a rev-tagged filename
-    - Also copy original bytes to NEXT_STAGE_IN with same basename (so next stage can be run separately)
-    """
-    p_in, p_out, p_done = _stage_vars(stage)
-    if not (p_in and p_out and p_done):
-        raise RuntimeError(f"Stage{stage} paths are missing. IN/OUT/DONE must be set.")
-
-    # ensure folders
-    io.ensure_folder(os.path.dirname(p_in) or "/")
-    io.ensure_folder(p_in)
-    io.ensure_folder(p_out)
-    io.ensure_folder(p_done)
-
-    state = store.load()
-    bucket = store.get_stage_bucket(state, stage)
-    bucket["last_run_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    entries = [e for e in io.list_folder(p_in) if e.is_file and _is_xlsx(e.name)]
-    entries = entries[:max_files]
-
-    processed = 0
-    for e in entries:
-        k = _file_key(e)
-        if store.is_done(bucket, k):
+        if not full_text:
             continue
 
-        src_path = e.path
-        base = e.name
+        # V列
+        v_text = call_api(PROMPT_V.format(TEXT=full_text))
+        ws[f"{COL_V}{row}"] = v_text
 
-        # 1) download bytes
-        data = io.download(src_path)
+        # W列
+        w_text = call_api(PROMPT_W.format(TEXT=full_text))
+        ws[f"{COL_W}{row}"] = w_text
 
-        # 2) write OUT (keep original for debugging)
-        out_name = f"{os.path.splitext(base)[0]}__stage{stage}__{_utc_stamp()}{os.path.splitext(base)[1]}"
-        out_path = f"{p_out}/{out_name}"
-        io.upload_overwrite(out_path, data)
+        time.sleep(1)
 
-        # 3) move to DONE (rename with rev)
-        rev = e.rev or "no-rev"
-        done_name = f"{os.path.splitext(base)[0]}__rev-{rev}__{_utc_stamp()}{os.path.splitext(base)[1]}"
-        done_path = f"{p_done}/{done_name}"
-        # Dropbox move keeps server-side file, fast.
-        io.move_replace(src_path, done_path)
-
-        # 4) copy forward to next stage IN (optional)
-        nxt = _next_stage(stage)
-        if nxt:
-            nxt_in, _, _ = _stage_vars(nxt)
-            if nxt_in:
-                io.ensure_folder(nxt_in)
-                nxt_path = f"{nxt_in}/{base}"
-                io.upload_overwrite(nxt_path, data)
-
-        # 5) mark done + persist state (atomic)
-        store.mark_done(bucket, k)
-        store.save(state)
-
-        logger.log(
-            {
-                "event": "file_processed",
-                "stage": stage,
-                "src": src_path,
-                "out": out_path,
-                "done": done_path,
-                "copied_to_next_in": bool(nxt),
-                "size": len(data),
-            }
-        )
-
-        processed += 1
-
-    logger.log({"event": "stage_end", "stage": stage, "processed": processed, "in_count": len(entries)})
-    return processed
-
-
-def main() -> int:
-    # credentials
-    tok = _env("DROPBOX_REFRESH_TOKEN")
-    app_key = _env("DROPBOX_APP_KEY")
-    app_secret = _env("DROPBOX_APP_SECRET")
-
-    # controls
-    stage = _env("MONTHLY_STAGE", "00")
-    max_files = int(_env("MAX_FILES_PER_RUN", "200") or "200")
-
-    # state & logs
-    state_path = _env("STATE_PATH", "/_system/state.json")  # IMPORTANT default
-    logs_dir = _env("LOGS_DIR", "/_system/logs")
-
-    io = DropboxIO(refresh_token=tok, app_key=app_key, app_secret=app_secret)
-    logger = JsonlLogger(io, logs_dir=logs_dir)
-    store = StateStore(io=io, state_path=state_path)
-
-    logger.log({"event": "run_start", "stage": stage, "state_path": state_path, "logs_dir": logs_dir})
-
-    if stage not in {"00", "10", "20", "30", "40"}:
-        raise RuntimeError("MONTHLY_STAGE must be one of 00/10/20/30/40")
-
-    processed = stage_copy_forward(
-        io=io,
-        logger=logger,
-        store=store,
-        stage=stage,
-        max_files=max_files,
-    )
-
-    logger.log({"event": "run_end", "stage": stage, "processed": processed})
-    return 0
+    wb.save(out_path)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    in_file = sys.argv[1]
+    out_file = sys.argv[2]
+    run_stage20(in_file, out_file)
