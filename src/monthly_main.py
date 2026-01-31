@@ -2,15 +2,12 @@
 """
 monthly_main.py
 
-目的:
 - GitHub Actions から `python -m src.monthly_main` で引数なし起動しても落ちない
-- 環境変数 MONTHLY_STAGE (00/10/20/30/40) に応じて、Dropbox の IN/OUT/DONE を処理する
-- 現時点の実装は「stage copy-forward（IN→OUTへコピー、IN→DONEへ移動、次ステージINへコピー）」を提供
-- state.json に「処理済み」を記録して再処理を避ける
-- logs_dir に jsonl で runログを残す
-
-注意:
-- ここでは OpenAI API はまだ呼ばない（OPENAI_API_KEY がなくても stage00 は動く）
+- MONTHLY_STAGE (00/10/20/30/40) に応じて Dropbox の IN を処理する
+- 現時点は「stage copy-forward」:
+    INのExcelを OUTへコピー保存 → 元INを DONEへ移動 → 次ステージINへコピー（あれば）
+- state.json に処理済みを記録して再処理を避ける
+- logs_dir に jsonl を書く
 """
 
 from __future__ import annotations
@@ -26,21 +23,21 @@ import dropbox
 from dropbox.exceptions import ApiError
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
-
 def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name, default) or "").strip()
+
 
 def _utc_now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+
 def _utc_stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
 
+
 def _today_utc_yyyymmdd() -> str:
     return time.strftime("%Y%m%d", time.gmtime())
+
 
 def _safe_int(name: str, default: int) -> int:
     v = _env(name, "")
@@ -51,9 +48,11 @@ def _safe_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 def _is_excel(name: str) -> bool:
     n = name.lower()
     return n.endswith(".xlsx") or n.endswith(".xlsm") or n.endswith(".xls")
+
 
 def _stage_vars(stage: str) -> Tuple[str, str, str]:
     return (
@@ -62,6 +61,7 @@ def _stage_vars(stage: str) -> Tuple[str, str, str]:
         _env(f"STAGE{stage}_DONE"),
     )
 
+
 def _next_stage(stage: str) -> str:
     order = ["00", "10", "20", "30", "40"]
     if stage not in order:
@@ -69,19 +69,14 @@ def _next_stage(stage: str) -> str:
     i = order.index(stage)
     return order[i + 1] if i + 1 < len(order) else ""
 
+
 def _file_key(path: str, rev: str) -> str:
-    # だいたい安定: path + rev。rev が取れないケースもあるので保険で path のみも許容
-    if rev:
-        return f"{path}@{rev}"
-    return path
+    return f"{path}@{rev}" if rev else path
+
 
 def _sha256_12(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
-
-# -----------------------------
-# Dropbox thin wrapper
-# -----------------------------
 
 @dataclass
 class DbxEntry:
@@ -90,6 +85,7 @@ class DbxEntry:
     is_file: bool
     size: int = 0
     rev: str = ""
+
 
 class DropboxIO:
     def __init__(self, *, refresh_token: str, app_key: str, app_secret: str):
@@ -109,7 +105,6 @@ class DropboxIO:
     def ensure_folder(self, path: str) -> None:
         if not path:
             return
-        # Dropbox folder paths should start with "/"
         if not path.startswith("/"):
             raise RuntimeError(f"Dropbox path must start with '/': {path!r}")
 
@@ -122,9 +117,8 @@ class DropboxIO:
         try:
             self.dbx.files_create_folder_v2(path)
         except ApiError as e:
-            # already exists race
-            msg = str(e)
-            if "conflict" in msg.lower():
+            msg = str(e).lower()
+            if "conflict" in msg:
                 return
             raise
 
@@ -150,15 +144,7 @@ class DropboxIO:
                     )
                 )
             elif t == "FolderMetadata":
-                out.append(
-                    DbxEntry(
-                        path=ent.path_display or "",
-                        name=ent.name or "",
-                        is_file=False,
-                        size=0,
-                        rev="",
-                    )
-                )
+                out.append(DbxEntry(path=ent.path_display or "", name=ent.name or "", is_file=False))
         return out
 
     def download(self, path: str) -> bytes:
@@ -170,38 +156,26 @@ class DropboxIO:
 
     def upload_overwrite(self, path: str, data: bytes) -> None:
         try:
-            self.dbx.files_upload(
-                data,
-                path,
-                mode=dropbox.files.WriteMode.overwrite,
-                mute=True,
-            )
+            self.dbx.files_upload(data, path, mode=dropbox.files.WriteMode.overwrite, mute=True)
         except ApiError as e:
             raise RuntimeError(f"Dropbox upload failed: {path!r} {e}") from e
 
     def move_replace(self, src: str, dst: str) -> None:
         try:
-            self.dbx.files_move_v2(
-                src,
-                dst,
-                autorename=False,
-                allow_shared_folder=True,
-            )
+            self.dbx.files_move_v2(src, dst, autorename=False, allow_shared_folder=True)
+            return
         except ApiError:
-            # replace by delete+move if needed
-            try:
-                self.dbx.files_delete_v2(dst)
-            except ApiError:
-                pass
-            try:
-                self.dbx.files_move_v2(
-                    src,
-                    dst,
-                    autorename=False,
-                    allow_shared_folder=True,
-                )
-            except ApiError as e:
-                raise RuntimeError(f"Dropbox move failed: {src!r} -> {dst!r} {e}") from e
+            pass
+
+        try:
+            self.dbx.files_delete_v2(dst)
+        except ApiError:
+            pass
+
+        try:
+            self.dbx.files_move_v2(src, dst, autorename=False, allow_shared_folder=True)
+        except ApiError as e:
+            raise RuntimeError(f"Dropbox move failed: {src!r} -> {dst!r} {e}") from e
 
     def read_json(self, path: str) -> Optional[Dict[str, Any]]:
         try:
@@ -218,36 +192,14 @@ class DropboxIO:
         self.upload_overwrite(path, raw)
 
 
-# -----------------------------
-# State store
-# -----------------------------
-
 class StateStore:
-    """
-    state.json schema (minimal):
-    {
-      "updated_at_utc": "...",
-      "stages": {
-        "00": {
-          "last_run_utc": "...",
-          "done": {
-            "<path>@<rev>": true,
-            ...
-          }
-        },
-        ...
-      }
-    }
-    """
     def __init__(self, *, io: DropboxIO, state_path: str):
         self.io = io
         self.state_path = state_path
 
     def load(self) -> Dict[str, Any]:
         obj = self.io.read_json(self.state_path)
-        if isinstance(obj, dict) and "stages" in obj:
-            if not isinstance(obj.get("stages"), dict):
-                obj["stages"] = {}
+        if isinstance(obj, dict) and isinstance(obj.get("stages"), dict):
             return obj
         return {"updated_at_utc": _utc_now_iso(), "stages": {}}
 
@@ -266,17 +218,12 @@ class StateStore:
         return b
 
     def is_done(self, bucket: Dict[str, Any], key: str) -> bool:
-        done = bucket.get("done", {})
-        return bool(done.get(key))
+        return bool(bucket.get("done", {}).get(key))
 
     def mark_done(self, bucket: Dict[str, Any], key: str) -> None:
         bucket.setdefault("done", {})
         bucket["done"][key] = True
 
-
-# -----------------------------
-# Logger (jsonl to Dropbox)
-# -----------------------------
 
 class JsonlLogger:
     def __init__(self, *, io: DropboxIO, logs_dir: str):
@@ -287,21 +234,16 @@ class JsonlLogger:
         self._lines: List[str] = []
 
     def log(self, obj: Dict[str, Any]) -> None:
-        obj = dict(obj)
-        obj.setdefault("ts_utc", _utc_now_iso())
-        self._lines.append(json.dumps(obj, ensure_ascii=False))
+        x = dict(obj)
+        x.setdefault("ts_utc", _utc_now_iso())
+        self._lines.append(json.dumps(x, ensure_ascii=False))
 
     def flush(self) -> None:
-        # ensure folders then write once
         self.io.ensure_folder(self.logs_dir)
         self.io.ensure_folder(self.run_folder)
         data = ("\n".join(self._lines) + "\n").encode("utf-8")
         self.io.upload_overwrite(self.run_file, data)
 
-
-# -----------------------------
-# Core: stage copy-forward
-# -----------------------------
 
 def stage_copy_forward(
     *,
@@ -313,19 +255,16 @@ def stage_copy_forward(
 ) -> int:
     p_in, p_out, p_done = _stage_vars(stage)
     if not (p_in and p_out and p_done):
-        raise RuntimeError(f"Stage{stage} paths are missing. STAGE{stage}_IN/OUT/DONE must be set.")
+        raise RuntimeError(f"Stage{stage} paths missing: STAGE{stage}_IN/OUT/DONE")
 
-    # ensure folders
     io.ensure_folder(p_in)
     io.ensure_folder(p_out)
     io.ensure_folder(p_done)
 
-    # load state
     state = store.load()
     bucket = store.bucket(state, stage)
     bucket["last_run_utc"] = _utc_now_iso()
 
-    # list IN
     entries = [e for e in io.list_folder(p_in) if e.is_file and _is_excel(e.name)]
     entries = entries[:max_files]
 
@@ -339,21 +278,17 @@ def stage_copy_forward(
         base = e.name
         root, ext = os.path.splitext(base)
 
-        # download bytes (once)
         data = io.download(src_path)
 
-        # write OUT (debug artifact)
         out_name = f"{root}__stage{stage}__{_utc_stamp()}{ext}"
         out_path = f"{p_out}/{out_name}"
         io.upload_overwrite(out_path, data)
 
-        # move original to DONE (rev-tag)
         rev = e.rev or "no-rev"
         done_name = f"{root}__rev-{rev}__{_utc_stamp()}{ext}"
         done_path = f"{p_done}/{done_name}"
         io.move_replace(src_path, done_path)
 
-        # copy forward to next stage IN (optional)
         nxt = _next_stage(stage)
         copied_to_next = False
         if nxt:
@@ -364,7 +299,6 @@ def stage_copy_forward(
                 io.upload_overwrite(nxt_path, data)
                 copied_to_next = True
 
-        # mark done + persist state
         store.mark_done(bucket, key)
         store.save(state)
 
@@ -385,53 +319,39 @@ def stage_copy_forward(
     return processed
 
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
-
 def main() -> int:
-    # credentials
     tok = _env("DROPBOX_REFRESH_TOKEN")
     app_key = _env("DROPBOX_APP_KEY")
     app_secret = _env("DROPBOX_APP_SECRET")
 
-    # controls
     stage = _env("MONTHLY_STAGE", "00")
     max_files = _safe_int("MAX_FILES_PER_RUN", 200)
 
-    # state & logs
     state_path = _env("STATE_PATH", "/_system/state.json")
     logs_dir = _env("LOGS_DIR", "/_system/logs")
 
     if stage not in {"00", "10", "20", "30", "40"}:
         raise RuntimeError("MONTHLY_STAGE must be one of 00/10/20/30/40")
 
-    # (optional) show non-secret diagnostics in logs
-    diag = {
-        "event": "run_start",
-        "stage": stage,
-        "state_path_len": len(state_path),
-        "state_path_sha256_12": _sha256_12(state_path) if state_path else "EMPTY",
-        "logs_dir": logs_dir,
-        "max_files": max_files,
-        "has_openai_key": bool(_env("OPENAI_API_KEY")),  # stage00では使わないが存在確認だけ
-        "openai_model": _env("OPENAI_MODEL", ""),
-        "depth": _env("DEPTH", ""),
-    }
-
     io = DropboxIO(refresh_token=tok, app_key=app_key, app_secret=app_secret)
     store = StateStore(io=io, state_path=state_path)
     logger = JsonlLogger(io=io, logs_dir=logs_dir)
 
-    logger.log(diag)
-
-    processed = stage_copy_forward(
-        io=io,
-        store=store,
-        logger=logger,
-        stage=stage,
-        max_files=max_files,
+    logger.log(
+        {
+            "event": "run_start",
+            "stage": stage,
+            "state_path_len": len(state_path),
+            "state_path_sha256_12": _sha256_12(state_path) if state_path else "EMPTY",
+            "logs_dir": logs_dir,
+            "max_files": max_files,
+            "has_openai_key": bool(_env("OPENAI_API_KEY")),
+            "openai_model": _env("OPENAI_MODEL", ""),
+            "depth": _env("DEPTH", ""),
+        }
     )
+
+    processed = stage_copy_forward(io=io, store=store, logger=logger, stage=stage, max_files=max_files)
 
     logger.log({"event": "run_end", "stage": stage, "processed": processed})
     logger.flush()
