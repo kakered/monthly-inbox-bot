@@ -1,133 +1,144 @@
 # -*- coding: utf-8 -*-
 """
-Stage 00 (minimal): Move/Copy files from IN -> OUT, then IN -> DONE.
-
-Purpose:
-- Prove stage dispatch wiring works.
-- Keep behavior simple and observable in Dropbox folders.
-
-Expected env (already provided by workflow):
-- paths['in'], paths['out'], paths['done']
+stage00.py
+目的：
+- 「本当に走った」を1回で証明する（marker を OUT に必ず作る）
+- IN にある Excel を OUT にコピーし、元を DONE に移動する（最小のIN→OUT→DONE）
+- ここで初めて“200回ループ”が止まる（観測可能な差分が出る）
 """
 
 from __future__ import annotations
 
 import os
-import time
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Dict
+
+import dropbox
+from dropbox.exceptions import ApiError
 
 
-def _ts_localish() -> str:
-    # use UTC to be deterministic in actions
-    return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
-def _join(base: str, name: str) -> str:
-    return base.rstrip("/") + "/" + name
+def safe_mkdir(dbx: dropbox.Dropbox, path: str) -> None:
+    if not path:
+        return
+    try:
+        dbx.files_create_folder_v2(path)
+    except Exception:
+        pass
 
 
-def _list_files(dbx: Any, folder: str):
-    """
-    Return a list of entries (FileMetadata-like) from Dropbox folder.
-    Supports:
-      - raw dropbox.Dropbox client: files_list_folder
-      - DropboxIO wrapper: list_folder (if exists)
-    """
-    if hasattr(dbx, "list_folder"):
-        return dbx.list_folder(folder)  # type: ignore
-
-    # raw SDK
+def list_files(dbx: dropbox.Dropbox, folder: str):
     res = dbx.files_list_folder(folder)
-    return res.entries
+    return [e for e in res.entries if type(e).__name__ == "FileMetadata"]
 
 
-def _download_bytes(dbx: Any, path: str) -> bytes:
-    """
-    Supports:
-      - DropboxIO: read_file_bytes/read_bytes
-      - raw SDK: files_download
-    """
-    if hasattr(dbx, "read_file_bytes"):
-        return dbx.read_file_bytes(path)  # type: ignore
-    if hasattr(dbx, "read_bytes"):
-        return dbx.read_bytes(path)  # type: ignore
+def run(*, dbx, paths, state, audit, config: Dict[str, Any], **kwargs) -> int:
+    # フォルダ前提チェック
+    for k in ["in_path", "out_path", "done_path"]:
+        v = getattr(paths, k, "")
+        if not v:
+            audit.write({
+                "ts_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "event": "error",
+                "where": "stage00",
+                "message": f"missing required path: {k}",
+            })
+            return 2
 
-    _md, resp = dbx.files_download(path)
-    return resp.content
+    safe_mkdir(dbx, paths.out_path)
+    safe_mkdir(dbx, paths.done_path)
 
+    # 1) marker を必ず作る（RUNが実際に stage00 に入った証拠）
+    marker_name = f"_stage00_marker__{utc_stamp()}.txt"
+    marker_path = f"{paths.out_path.rstrip('/')}/{marker_name}"
+    try:
+        dbx.files_upload(
+            f"stage00 alive at {utc_stamp()} UTC\n".encode("utf-8"),
+            marker_path,
+            mode=dropbox.files.WriteMode.add,
+        )
+        audit.write({
+            "ts_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "event": "stage00_marker_written",
+            "path": marker_path,
+        })
+    except Exception as e:
+        audit.write({
+            "ts_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "event": "warn",
+            "where": "stage00.marker",
+            "error": f"{type(e).__name__}: {e}",
+        })
+        # marker が書けないのは運用上致命なので落とす
+        return 1
 
-def _upload_bytes(dbx: Any, path: str, body: bytes, overwrite: bool = True):
-    """
-    Supports:
-      - DropboxIO: write_file_bytes/upload_bytes
-      - raw SDK: files_upload
-    """
-    if hasattr(dbx, "write_file_bytes"):
-        return dbx.write_file_bytes(path, body, overwrite=overwrite)  # type: ignore
-    if hasattr(dbx, "upload_bytes"):
-        return dbx.upload_bytes(path, body, overwrite=overwrite)  # type: ignore
+    # 2) IN のファイルを処理（最大 MAX_FILES_PER_RUN）
+    try:
+        files = list_files(dbx, paths.in_path)
+    except ApiError as e:
+        audit.write({
+            "ts_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "event": "error",
+            "where": "stage00.list",
+            "error": str(e),
+        })
+        return 1
 
-    import dropbox
-    mode = dropbox.files.WriteMode.overwrite if overwrite else dropbox.files.WriteMode.add
-    return dbx.files_upload(body, path, mode=mode)
-
-
-def _move(dbx: Any, src: str, dst: str):
-    """
-    Supports:
-      - DropboxIO: move
-      - raw SDK: files_move_v2
-    """
-    if hasattr(dbx, "move"):
-        return dbx.move(src, dst)  # type: ignore
-
-    return dbx.files_move_v2(src, dst, autorename=True)
-
-
-def run(*, dbx: Any, stage: str, paths: dict[str, str], state: Any = None, run_id: str = "", config: dict | None = None) -> int:
-    p_in = paths.get("in", "")
-    p_out = paths.get("out", "")
-    p_done = paths.get("done", "")
-
-    if not (p_in and p_out and p_done):
-        raise RuntimeError(f"Stage00 requires paths in/out/done. got={paths!r}")
-
-    entries = _list_files(dbx, p_in)
-    files = [e for e in entries if type(e).__name__ == "FileMetadata"]
-
-    # If wrapper returns plain dicts etc, accept those too
-    if not files and entries:
-        # best effort: treat anything with path_display as file
-        files = [e for e in entries if getattr(e, "path_display", None)]
+    max_n = int(str(config.get("MAX_FILES_PER_RUN", "200")))
+    files = files[:max_n]
 
     processed = 0
 
-    for e in files:
-        src = getattr(e, "path_display", None) or getattr(e, "path_lower", None)
-        name = getattr(e, "name", None) or os.path.basename(src or "")
-        if not src or not name:
-            continue
+    for f in files:
+        src = f.path_display
+        base = os.path.basename(src)
 
-        body = _download_bytes(dbx, src)
+        # OUT は “コピー” として保存（名前に stage + timestamp）
+        out_name = f"{os.path.splitext(base)[0]}__stage00__{utc_stamp()}{os.path.splitext(base)[1]}"
+        out_path = f"{paths.out_path.rstrip('/')}/{out_name}"
 
-        base, ext = os.path.splitext(name)
-        out_name = f"{base}__stage00__{_ts_localish()}{ext}"
-        out_path = _join(p_out, out_name)
+        # DONE は “move” でアーカイブ（rev付きで衝突回避しやすい）
+        done_name = f"{os.path.splitext(base)[0]}__rev-{getattr(f, 'rev', 'unknown')}__{utc_stamp()}{os.path.splitext(base)[1]}"
+        done_path = f"{paths.done_path.rstrip('/')}/{done_name}"
 
-        _upload_bytes(dbx, out_path, body, overwrite=True)
-
-        done_name = f"{base}__rev-{_ts_localish()}{ext}"
-        done_path = _join(p_done, done_name)
-        _move(dbx, src, done_path)
-
-        processed += 1
-
-    # Optional: write a tiny marker into state if available
-    if state is not None:
         try:
-            if hasattr(state, "set_stage_result"):
-                state.set_stage_result(stage, {"processed": processed, "run_id": run_id})  # type: ignore
-        except Exception:
-            pass
+            # copy -> OUT
+            dbx.files_copy_v2(src, out_path, allow_shared_folder=True, autorename=True)
+            # move -> DONE
+            dbx.files_move_v2(src, done_path, allow_shared_folder=True, autorename=True)
 
+            processed += 1
+            audit.write({
+                "ts_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "event": "stage00_processed",
+                "src": src,
+                "out": out_path,
+                "done": done_path,
+            })
+        except Exception as e:
+            audit.write({
+                "ts_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "event": "stage00_error",
+                "src": src,
+                "error": f"{type(e).__name__}: {e}",
+            })
+            # 1件でも失敗したら失敗扱い（安全側）
+            return 1
+
+    # state に記録（最低限）
+    try:
+        state.stages.setdefault("00", {})
+        state.stages["00"]["last_run_utc"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state.stages["00"]["processed"] = processed
+    except Exception:
+        pass
+
+    audit.write({
+        "ts_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "event": "stage00_summary",
+        "processed": processed,
+    })
     return 0

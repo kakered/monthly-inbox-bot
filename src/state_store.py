@@ -1,72 +1,66 @@
 # -*- coding: utf-8 -*-
+"""
+state_store.py
+- Dropbox 上の state.json を安全に読み書きする最小実装
+- "TypeError: StateStore.load() takes 1 positional argument but 2 were given" を根治
+"""
+
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
-
-from .dropbox_io import DropboxIO
-
-
-def _utc_ts() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 @dataclass
 class StateStore:
     """
-    Robust state store:
-    - If state missing OR invalid OR empty dict: still allows processing.
-    - Writes are atomic-upload-overwrite (no 3-bytes broken file).
+    Dropbox 上の state.json を管理するための軽量ストア。
     """
-    io: DropboxIO
-    state_path: str
+    stages: Dict[str, Any] = field(default_factory=dict)
+    updated_at_utc: str = ""
 
-    def load(self) -> Dict[str, Any]:
-        if not self.state_path:
-            # No state path => run without persistent state
-            return {}
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "StateStore":
+        return cls(
+            stages=d.get("stages", {}) if isinstance(d.get("stages", {}), dict) else {},
+            updated_at_utc=d.get("updated_at_utc", "") if isinstance(d.get("updated_at_utc", ""), str) else "",
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "stages": self.stages,
+            "updated_at_utc": self.updated_at_utc,
+        }
+
+    @classmethod
+    def load(cls, dbx, state_path: str) -> "StateStore":
+        """
+        Dropbox から state.json を読み込む。
+        state_path が存在しない/壊れている場合は空の state を返す。
+        """
+        if not state_path:
+            return cls()
 
         try:
-            raw = self.io.download(self.state_path)
-        except Exception:
-            return {}
-
-        try:
-            obj = json.loads(raw.decode("utf-8"))
+            _md, resp = dbx.files_download(state_path)
+            raw = resp.content.decode("utf-8", errors="replace")
+            obj = json.loads(raw)
             if isinstance(obj, dict):
-                return obj
-            return {}
+                return cls.from_dict(obj)
+            return cls()
         except Exception:
-            # If corrupted, do not block; just start fresh.
-            return {}
+            # 「壊れた state」で全体が止まるより、空 state で走らせる（ログに warn を出すのは呼び出し側）
+            return cls()
 
-    def save(self, state: Dict[str, Any]) -> None:
-        if not self.state_path:
+    def save(self, dbx, state_path: str) -> None:
+        """
+        Dropbox に state.json を上書き保存する。
+        """
+        if not state_path:
             return
-        # ensure JSON serializable, and include last_update
-        state = dict(state)
-        state["updated_at_utc"] = _utc_ts()
-        payload = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
-        self.io.atomic_upload_overwrite(self.state_path, payload, suffix=".tmp")
+        data = json.dumps(self.to_dict(), ensure_ascii=False, indent=2).encode("utf-8")
+        # overwrite=True が欲しいが SDK 仕様で mode 指定
+        import dropbox  # local import
 
-    @staticmethod
-    def get_stage_bucket(state: Dict[str, Any], stage: str) -> Dict[str, Any]:
-        buckets = state.setdefault("stages", {})
-        b = buckets.setdefault(stage, {})
-        # normalized keys
-        b.setdefault("done", [])         # list of identifiers
-        b.setdefault("last_run_utc", "")
-        return b
-
-    @staticmethod
-    def mark_done(bucket: Dict[str, Any], key: str) -> None:
-        done = bucket.setdefault("done", [])
-        if key not in done:
-            done.append(key)
-
-    @staticmethod
-    def is_done(bucket: Dict[str, Any], key: str) -> bool:
-        done = bucket.get("done", [])
-        return isinstance(done, list) and key in done
+        dbx.files_upload(data, state_path, mode=dropbox.files.WriteMode.overwrite)
