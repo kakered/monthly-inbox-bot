@@ -1,191 +1,253 @@
 # -*- coding: utf-8 -*-
 """
-monthly_main.py (FULL OVERWRITE VERSION)
+monthly_main.py
+Monthly pipeline orchestrator.
 
-- GitHub Actions / runpy / python -m 実行に完全対応
-- sys.argv に依存しない
-- MONTHLY_STAGE 環境変数駆動
-- Dropbox IN フォルダをスキャンして逐次処理
-- state.json により再処理防止
+GitHub Actions runs:
+  python -m src.monthly_main
+
+This module MUST NOT require CLI positional args.
+Control via env vars:
+- MONTHLY_STAGE: "00" | "10" | "20" | "30" | "40"  (default: "00")
+- DEPTH: "medium" | "heavy" (default: "medium")
+- OPENAI_MODEL: e.g., "gpt-5-mini" (default: "gpt-5-mini")
+- MAX_FILES_PER_RUN (default: 10)
+- MAX_INPUT_CHARS (default: 80000)
+- OPENAI_MAX_OUTPUT_TOKENS (default: 5000)
+- OPENAI_TIMEOUT (default: 90)
+- LOGS_DIR (default: "/_system/logs")
+- STATE_PATH (default: "/_system/state_monthly.json")
+- STAGE00_IN, STAGE00_OUT, STAGE00_DONE, ... similarly for other stages
+
+Secrets required:
+- OPENAI_API_KEY
+- DROPBOX_REFRESH_TOKEN
+- DROPBOX_APP_KEY
+- DROPBOX_APP_SECRET
 """
 
 from __future__ import annotations
 
 import os
-import sys
-import json
 import time
 import traceback
-from datetime import datetime, timezone
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
 
-from openai import OpenAI
-import dropbox
-from dropbox.files import FileMetadata
-from dropbox.exceptions import ApiError
-
-from state_store import StateStore
-from utils_dropbox_item import download_file, upload_file, move_file
+from .dropbox_io import DropboxIO
+from .logger import JsonlLogger
+from .state_store import StateStore, stable_key
+from .utils_dropbox_item import dbx_get, dbx_is_folder, dbx_name, dbx_path
 
 
-# =========================================================
-# 基本設定
-# =========================================================
+@dataclass
+class Cfg:
+    stage: str
+    depth: str
+    model: str
+    max_files: int
+    max_input_chars: int
+    max_output_tokens: int
+    timeout: int
 
-UTC = timezone.utc
+    logs_dir: str
+    state_path: str
 
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
-DEPTH = os.environ.get("DEPTH", "medium")
-
-MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "200"))
-MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "80000"))
-
-MONTHLY_STAGE = (os.environ.get("MONTHLY_STAGE", "00") or "00").strip()
-
-LOGS_DIR = os.environ.get("LOGS_DIR", "/_system/logs")
-STATE_PATH = os.environ.get("STATE_PATH", "/_system/state.json")
+    in_dir: str
+    out_dir: str
+    done_dir: str
 
 
-def stage_path(stage: str, kind: str) -> str:
-    key = f"STAGE{stage}_{kind}"
+def _env(key: str, default: str) -> str:
     v = os.environ.get(key)
-    if not v:
-        raise RuntimeError(f"Missing env var: {key}")
-    return v
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip()
 
 
-STAGE_IN = stage_path(MONTHLY_STAGE, "IN")
-STAGE_OUT = stage_path(MONTHLY_STAGE, "OUT")
-STAGE_DONE = stage_path(MONTHLY_STAGE, "DONE")
-
-
-# =========================================================
-# 初期化
-# =========================================================
-
-def init_dropbox() -> dropbox.Dropbox:
-    return dropbox.Dropbox(
-        oauth2_refresh_token=os.environ["DROPBOX_REFRESH_TOKEN"],
-        app_key=os.environ["DROPBOX_APP_KEY"],
-        app_secret=os.environ["DROPBOX_APP_SECRET"],
-    )
-
-
-def init_openai() -> OpenAI:
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-
-# =========================================================
-# ログ
-# =========================================================
-
-def log_event(event: dict):
-    today = datetime.now(UTC).strftime("%Y%m%d")
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    path = f"{LOGS_DIR}/{today}/run_{ts}.jsonl"
-
-    event = dict(event)
-    event["ts_utc"] = datetime.now(UTC).isoformat()
-
-    upload_file(
-        dbx,
-        path,
-        (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"),
-        mode="add",
-    )
-
-
-# =========================================================
-# Dropbox ユーティリティ
-# =========================================================
-
-def list_inbox_files(dbx: dropbox.Dropbox) -> List[FileMetadata]:
+def _env_int(key: str, default: int) -> int:
+    v = os.environ.get(key)
+    if v is None or str(v).strip() == "":
+        return int(default)
     try:
-        res = dbx.files_list_folder(STAGE_IN)
-    except ApiError as e:
-        raise RuntimeError(f"Dropbox list_folder failed: {e}")
-
-    files = [
-        e for e in res.entries
-        if isinstance(e, FileMetadata)
-    ]
-    return files[:MAX_FILES_PER_RUN]
+        return int(str(v).strip())
+    except Exception:
+        return int(default)
 
 
-# =========================================================
-# メイン処理（stage 00 用：Excel 前処理想定）
-# =========================================================
+def load_cfg() -> Cfg:
+    stage = _env("MONTHLY_STAGE", "00")
+    if stage not in {"00", "10", "20", "30", "40"}:
+        stage = "00"
 
-def process_stage_00(file: FileMetadata):
-    """
-    Stage00:
-    - Excel をそのまま OUT にコピー（前処理）
-    """
-    raw = download_file(dbx, file.path_lower)
+    depth = _env("DEPTH", "medium").lower()
+    if depth not in {"medium", "heavy"}:
+        depth = "medium"
 
-    out_name = (
-        os.path.splitext(file.name)[0]
-        + f"__stage00__{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.xlsx"
+    model = _env("OPENAI_MODEL", "gpt-5-mini")
+    max_files = _env_int("MAX_FILES_PER_RUN", 10)
+    max_input_chars = _env_int("MAX_INPUT_CHARS", 80000)
+    max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 5000)
+    timeout = _env_int("OPENAI_TIMEOUT", 90)
+
+    logs_dir = _env("LOGS_DIR", "/_system/logs")
+    state_path = _env("STATE_PATH", "/_system/state_monthly.json")
+
+    in_dir = _env(f"STAGE{stage}_IN", f"/{stage}_inbox/IN")
+    out_dir = _env(f"STAGE{stage}_OUT", f"/{stage}_inbox/OUT")
+    done_dir = _env(f"STAGE{stage}_DONE", f"/{stage}_inbox/DONE")
+
+    return Cfg(
+        stage=stage,
+        depth=depth,
+        model=model,
+        max_files=max_files,
+        max_input_chars=max_input_chars,
+        max_output_tokens=max_output_tokens,
+        timeout=timeout,
+        logs_dir=logs_dir,
+        state_path=state_path,
+        in_dir=in_dir,
+        out_dir=out_dir,
+        done_dir=done_dir,
     )
-    out_path = f"{STAGE_OUT}/{out_name}"
-
-    upload_file(dbx, out_path, raw, mode="add")
-
-    # DONE に移動
-    move_file(dbx, file.path_lower, f"{STAGE_DONE}/{file.name}")
 
 
-# =========================================================
-# エントリポイント
-# =========================================================
+def _now_run_id() -> str:
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
-def main():
-    global dbx
 
-    start = time.time()
+def _list_inbox_files(dbx: DropboxIO, in_dir: str) -> List[Any]:
+    entries = dbx.list_folder(in_dir)
+    out: List[Any] = []
+    for it in entries:
+        if dbx_is_folder(it):
+            continue
+        p = dbx_path(it)
+        if not p:
+            continue
+        out.append(it)
+    return out
+
+
+def _sort_entries(entries: List[Any]) -> List[Any]:
+    # stable sort by name then path (so deterministic)
+    def keyfn(it: Any) -> Tuple[str, str]:
+        n = dbx_name(it) or ""
+        p = dbx_path(it) or ""
+        return (n.lower(), p.lower())
+
+    return sorted(entries, key=keyfn)
+
+
+def _basename_without_ext(name: str) -> str:
+    # handles .xlsx, .xls, etc.
+    if "." not in name:
+        return name
+    return ".".join(name.split(".")[:-1])
+
+
+def _out_filename(src_name: str, stage: str) -> str:
+    base = _basename_without_ext(src_name)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return f"{base}__stage{stage}__{stamp}.xlsx"
+
+
+def _process_stage00(dbx: DropboxIO, cfg: Cfg, state: StateStore, logger: JsonlLogger) -> int:
+    """
+    Stage00: 'raw inbox' -> 'normalized excel'
+    For now, this stage simply copies the file to OUT with renaming.
+    (Your next iterations can transform, split rows, etc.)
+    """
+    entries = _sort_entries(_list_inbox_files(dbx, cfg.in_dir))
     processed = 0
 
-    log_event({"event": "run_start", "stage": MONTHLY_STAGE})
+    for it in entries[: cfg.max_files]:
+        src_path = dbx_path(it)
+        src_name = dbx_name(it) or "input.xlsx"
+        if not src_path:
+            continue
 
-    files = list_inbox_files(dbx)
-
-    for f in files:
-        if state.is_done(MONTHLY_STAGE, f.path_lower):
+        # key uses path + content_hash if present
+        ch = dbx_get(it, "content_hash", None)
+        key = stable_key(src_path, ch if isinstance(ch, str) else None)
+        if state.is_processed(key):
+            logger.log(event="skip_already_processed", stage=cfg.stage, src=src_path)
             continue
 
         try:
-            if MONTHLY_STAGE == "00":
-                process_stage_00(f)
-            else:
-                raise NotImplementedError(f"Stage {MONTHLY_STAGE} not implemented")
+            b = dbx.download_to_bytes(src_path)
+            out_name = _out_filename(src_name, cfg.stage)
+            out_path = f"{cfg.out_dir.rstrip('/')}/{out_name}"
+            dbx.write_file_bytes(out_path, b, overwrite=True)
 
-            state.mark_done(MONTHLY_STAGE, f.path_lower)
+            # move original to DONE
+            dst_done = f"{cfg.done_dir.rstrip('/')}/{src_name}"
+            dbx.move(src_path, dst_done, autorename=True)
+
+            state.mark_processed(key, f"{cfg.stage}:{_now_run_id()}")
+            state.add_done(src_path)
+            state.log(event="processed", stage=cfg.stage, src=src_path, out=out_path, done=dst_done)
+            logger.log(event="processed", stage=cfg.stage, src=src_path, out=out_path, done=dst_done)
             processed += 1
-
         except Exception as e:
-            log_event({
-                "event": "file_error",
-                "stage": MONTHLY_STAGE,
-                "file": f.path_display,
-                "error": repr(e),
-                "traceback": traceback.format_exc(),
-            })
+            tb = traceback.format_exc()
+            err = {"src": src_path, "error": repr(e), "traceback": tb, "stage": cfg.stage}
+            state.add_error(err)
+            state.log(event="error", **err)
+            logger.log(event="error", **err)
 
-    state.flush()
-
-    log_event({
-        "event": "run_end",
-        "stage": MONTHLY_STAGE,
-        "processed": processed,
-        "elapsed_s": round(time.time() - start, 2),
-    })
+    return processed
 
 
-# =========================================================
-# 実行
-# =========================================================
+def main() -> int:
+    run_id = _now_run_id()
+    cfg = load_cfg()
+
+    # Dropbox client
+    dbx = DropboxIO.from_env()
+
+    # logger (writes to Dropbox via DropboxIO)
+    logger = JsonlLogger(dbx=dbx, logs_dir=cfg.logs_dir, prefix=f"stage{cfg.stage}", run_id=run_id)
+
+    # state
+    state = StateStore.load(dbx=dbx, path=cfg.state_path)
+
+    logger.log(event="run_start", stage=cfg.stage, run_id=run_id, cfg=cfg.__dict__)
+    state.log(event="run_start", stage=cfg.stage, run_id=run_id)
+
+    processed = 0
+    try:
+        if cfg.stage == "00":
+            processed = _process_stage00(dbx, cfg, state, logger)
+        else:
+            # Placeholder for other stages
+            logger.log(event="noop_stage", stage=cfg.stage, msg="Stage not implemented yet")
+            state.log(event="noop_stage", stage=cfg.stage, msg="Stage not implemented yet")
+
+        # save state
+        state.save(dbx)
+        # flush audit
+        audit_path = state.flush_audit_jsonl(dbx, cfg.logs_dir, run_id)
+        logger.log(event="audit_flushed", stage=cfg.stage, path=audit_path)
+
+        logger.log(event="run_end", stage=cfg.stage, processed=processed)
+        return 0
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.log(event="fatal", stage=cfg.stage, error=repr(e), traceback=tb)
+        state.add_error({"stage": cfg.stage, "error": repr(e), "traceback": tb})
+        try:
+            state.save(dbx)
+        except Exception:
+            pass
+        return 1
+    finally:
+        try:
+            logger.flush()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
-    dbx = init_dropbox()
-    state = StateStore(dbx, STATE_PATH)
-    main()
+    raise SystemExit(main())
