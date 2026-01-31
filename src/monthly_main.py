@@ -1,181 +1,233 @@
 # -*- coding: utf-8 -*-
 """
-Monthly pipeline entry (GitHub Actions-friendly):
-- No positional argv required.
-- Uses env vars (MONTHLY_STAGE, STAGExx_IN/OUT/DONE, LOGS_DIR, STATE_PATH, etc.)
-- Creates minimal audit records and uploads them to Dropbox logs folder.
+src/monthly_main.py
+
+MONTHLY pipeline entrypoint.
+
+Design goal:
+- Must run safely with NO CLI args (GitHub Actions runs: python -m src.monthly_main)
+- Stage-driven routing via env vars:
+    MONTHLY_STAGE in {"00","10","20","30","40"}
+    STAGE00_IN/OUT/DONE, ... STAGE40_IN/OUT/DONE
+- Minimal robust behavior (stage_copy_forward):
+    * list .xlsx/.xlsm in STAGEXX_IN
+    * download bytes
+    * upload copy to STAGEXX_OUT (stage-tagged filename)
+    * move original to STAGEXX_DONE (rev-tagged filename)
+    * optionally copy original bytes forward to next stage IN (same basename)
+    * persist state.json to skip already-processed items
+
+Notes:
+- This module intentionally does NOT require sys.argv[1].
+- If you later want a "single file mode", add optional args but keep default no-arg path.
 """
 
 from __future__ import annotations
 
 import os
-import sys
-import traceback
-from typing import Callable, Optional, Tuple
+import time
+from typing import Tuple
 
-from src.monthly_cfg import MonthlyConfig
-from src.logger import write_audit_record
-from src.state_store import StateStore
-from src.utils_dropbox_item import DropboxClient
+from .dropbox_io import DropboxIO, DbxEntry
+from .state_store import StateStore
+from .logger import JsonlLogger
 
 
-def _env(key: str, default: str = "") -> str:
-    return (os.environ.get(key, default) or default).strip()
+# ----------------------------
+# helpers
+# ----------------------------
+def _env(name: str, default: str = "") -> str:
+    return (os.environ.get(name, default) or "").strip()
 
 
-def _require_env(key: str) -> str:
-    v = _env(key)
-    if not v:
-        raise RuntimeError(f"Missing required env: {key}")
-    return v
+def _utc_stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
 
 
-def _import_pipeline_entry() -> Callable:
-    """
-    Resolve pipeline function dynamically to keep monthly_main small and stable.
-    Preferred: src.monthly_pipeline_MULTISTAGE.run
-    """
-    try:
-        from src.monthly_pipeline_MULTISTAGE import run as pipeline_run  # type: ignore
-        return pipeline_run
-    except Exception as e:
-        raise RuntimeError("Failed to import pipeline entry: src.monthly_pipeline_MULTISTAGE.run") from e
-
-
-def _call_pipeline(func: Callable, dbx: DropboxClient, state: StateStore, cfg: MonthlyConfig) -> int:
-    """
-    Call pipeline with flexible signature:
-    - run(dbx, state, cfg)
-    - run(cfg, dbx, state)
-    - run(cfg)
-    """
-    try:
-        # Most likely: (dbx, state, cfg)
-        return int(func(dbx, state, cfg))
-    except TypeError:
-        pass
-
-    try:
-        # Alternate: (cfg, dbx, state)
-        return int(func(cfg, dbx, state))
-    except TypeError:
-        pass
-
-    try:
-        # Minimal: (cfg)
-        return int(func(cfg))
-    except TypeError as e:
-        raise RuntimeError(
-            "Pipeline entry signature not supported. "
-            "Expected one of: run(dbx, state, cfg) / run(cfg, dbx, state) / run(cfg)"
-        ) from e
-
-
-def _resolve_stage_paths(stage: str) -> Tuple[str, str, str]:
-    stage = stage.zfill(2)
-    p_in = _env(f"STAGE{stage}_IN")
-    p_out = _env(f"STAGE{stage}_OUT")
-    p_done = _env(f"STAGE{stage}_DONE")
-    return p_in, p_out, p_done
-
-
-def main() -> int:
-    # ---- required env ----
-    dropbox_refresh_token = _require_env("DROPBOX_REFRESH_TOKEN")
-    dropbox_app_key = _require_env("DROPBOX_APP_KEY")
-    dropbox_app_secret = _require_env("DROPBOX_APP_SECRET")
-
-    state_path = _require_env("STATE_PATH")
-    logs_dir = _require_env("LOGS_DIR")
-
-    stage = _env("MONTHLY_STAGE", "00") or "00"
-    stage = stage.strip()
-
-    # stage folder env sanity (not strictly required here, but pipeline will use them)
-    p_in, p_out, p_done = _resolve_stage_paths(stage)
-
-    # ---- client ----
-    dbx = DropboxClient(
-        oauth2_refresh_token=dropbox_refresh_token,
-        app_key=dropbox_app_key,
-        app_secret=dropbox_app_secret,
+def _stage_vars(stage: str) -> Tuple[str, str, str]:
+    return (
+        _env(f"STAGE{stage}_IN"),
+        _env(f"STAGE{stage}_OUT"),
+        _env(f"STAGE{stage}_DONE"),
     )
 
-    # ---- state ----
-    state = StateStore(dbx=dbx, state_path_dropbox=state_path)
 
-    # ---- config ----
-    cfg = MonthlyConfig.from_env()
-    cfg.monthly_stage = stage
+def _next_stage(stage: str) -> str:
+    order = ["00", "10", "20", "30", "40"]
+    if stage not in order:
+        return ""
+    i = order.index(stage)
+    return order[i + 1] if (i + 1) < len(order) else ""
 
-    # Helpful context (stdout only; do NOT print secrets)
-    print(f"[monthly_main] stage={stage!r}", flush=True)
-    print(f"[monthly_main] folders: IN={p_in!r} OUT={p_out!r} DONE={p_done!r}", flush=True)
-    print(f"[monthly_main] state_path={state_path!r} logs_dir={logs_dir!r}", flush=True)
-    print(f"[monthly_main] model={_env('OPENAI_MODEL')} depth={_env('DEPTH')}", flush=True)
 
-    # Ensure logs folder exists (best-effort)
-    try:
-        dbx.ensure_folder(logs_dir)
-    except Exception:
-        print("[monthly_main] ensure_folder(logs_dir) failed (non-fatal)", file=sys.stderr)
-        traceback.print_exc()
+def _is_xlsx(name: str) -> bool:
+    n = name.lower()
+    return n.endswith(".xlsx") or n.endswith(".xlsm")
 
-    # --- audit: start snapshot ---
-    try:
-        local_audit = write_audit_record(
-            dbx,
-            logs_dir_dropbox=logs_dir,
-            folders={"in": p_in, "out": p_out, "done": p_done},
-            event="start",
-            extra={
-                "monthly_stage": stage,
-                "openai_model": _env("OPENAI_MODEL"),
-            },
+
+def _file_key(e: DbxEntry) -> str:
+    # stable-ish: path + rev if present
+    if getattr(e, "rev", None):
+        return f"{e.path}@{e.rev}"
+    return e.path
+
+
+def _require_nonempty(name: str, value: str) -> None:
+    if not value:
+        raise RuntimeError(f"Missing required env: {name}")
+
+
+# ----------------------------
+# stage runner
+# ----------------------------
+def stage_copy_forward(
+    *,
+    io: DropboxIO,
+    logger: JsonlLogger,
+    store: StateStore,
+    stage: str,
+    max_files: int,
+) -> int:
+    """
+    Minimal robust behavior:
+    - Read files from STAGEXX_IN
+    - Copy bytes to STAGEXX_OUT with a stage-tagged filename
+    - Move original to STAGEXX_DONE with a rev-tagged filename
+    - Also copy original bytes to NEXT_STAGE_IN with same basename (optional)
+    """
+    p_in, p_out, p_done = _stage_vars(stage)
+    if not (p_in and p_out and p_done):
+        raise RuntimeError(
+            f"Stage{stage} paths are missing. "
+            f"Need STAGE{stage}_IN / STAGE{stage}_OUT / STAGE{stage}_DONE."
         )
-        try:
-            dbx.upload(local_audit, f"{logs_dir}/" + os.path.basename(local_audit), mode="overwrite")
-        except Exception:
-            print("[audit] upload failed (start)", file=sys.stderr)
-            traceback.print_exc()
-    except Exception:
-        local_audit = ""
-        print("[audit] write failed (start)", file=sys.stderr)
-        traceback.print_exc()
 
-    # --- run pipeline ---
-    rc = 1
-    try:
-        func = _import_pipeline_entry()
-        rc = _call_pipeline(func, dbx, state, cfg)
-    except Exception:
-        print("[monthly_main] pipeline crashed", file=sys.stderr)
-        traceback.print_exc()
-        rc = 1
+    # ensure folders exist (best-effort; DropboxIO should be idempotent)
+    io.ensure_folder(os.path.dirname(p_in) or "/")
+    io.ensure_folder(p_in)
+    io.ensure_folder(p_out)
+    io.ensure_folder(p_done)
 
-    # --- audit: end snapshot ---
-    try:
-        rid = ""
-        if local_audit:
-            rid = os.path.basename(local_audit).replace("monthly_audit_", "").replace(".jsonl", "")
-        local_audit2 = write_audit_record(
-            dbx,
-            logs_dir_dropbox=logs_dir,
-            folders={"in": p_in, "out": p_out, "done": p_done},
-            event="end",
-            extra={"return_code": rc},
-            run_id=rid or None,
+    state = store.load()
+    bucket = store.get_stage_bucket(state, stage)
+    bucket["last_run_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # list inputs
+    entries = [e for e in io.list_folder(p_in) if e.is_file and _is_xlsx(e.name)]
+    entries = entries[: max_files if max_files > 0 else 0]
+
+    processed = 0
+    for e in entries:
+        k = _file_key(e)
+        if store.is_done(bucket, k):
+            continue
+
+        src_path = e.path
+        base = e.name
+
+        # 1) download bytes
+        data = io.download(src_path)
+
+        # 2) write OUT (keep original copy for debugging)
+        stem, ext = os.path.splitext(base)
+        out_name = f"{stem}__stage{stage}__{_utc_stamp()}{ext}"
+        out_path = f"{p_out}/{out_name}"
+        io.upload_overwrite(out_path, data)
+
+        # 3) move to DONE (rename with rev)
+        rev = e.rev or "no-rev"
+        done_name = f"{stem}__rev-{rev}__{_utc_stamp()}{ext}"
+        done_path = f"{p_done}/{done_name}"
+        io.move_replace(src_path, done_path)
+
+        # 4) copy forward to next stage IN (optional)
+        nxt = _next_stage(stage)
+        copied_forward = False
+        if nxt:
+            nxt_in, _, _ = _stage_vars(nxt)
+            if nxt_in:
+                io.ensure_folder(nxt_in)
+                nxt_path = f"{nxt_in}/{base}"
+                io.upload_overwrite(nxt_path, data)
+                copied_forward = True
+
+        # 5) mark done + persist state
+        store.mark_done(bucket, k)
+        store.save(state)
+
+        logger.log(
+            {
+                "event": "file_processed",
+                "stage": stage,
+                "src": src_path,
+                "out": out_path,
+                "done": done_path,
+                "copied_to_next_in": copied_forward,
+                "size": len(data),
+            }
         )
-        try:
-            dbx.upload(local_audit2, f"{logs_dir}/" + os.path.basename(local_audit2), mode="overwrite")
-        except Exception:
-            print("[audit] upload failed (end)", file=sys.stderr)
-            traceback.print_exc()
-    except Exception:
-        print("[audit] write failed (end)", file=sys.stderr)
-        traceback.print_exc()
 
-    return int(rc)
+        processed += 1
+
+    logger.log(
+        {
+            "event": "stage_end",
+            "stage": stage,
+            "processed": processed,
+            "in_count_scanned": len(entries),
+        }
+    )
+    return processed
+
+
+# ----------------------------
+# main
+# ----------------------------
+def main() -> int:
+    # credentials
+    tok = _env("DROPBOX_REFRESH_TOKEN")
+    app_key = _env("DROPBOX_APP_KEY")
+    app_secret = _env("DROPBOX_APP_SECRET")
+
+    # controls
+    stage = _env("MONTHLY_STAGE", "00")
+    max_files = int(_env("MAX_FILES_PER_RUN", "200") or "200")
+
+    # state & logs
+    state_path = _env("STATE_PATH", "/_system/state.json")
+    logs_dir = _env("LOGS_DIR", "/_system/logs")
+
+    # validate minimum envs
+    _require_nonempty("DROPBOX_REFRESH_TOKEN", tok)
+    _require_nonempty("DROPBOX_APP_KEY", app_key)
+    _require_nonempty("DROPBOX_APP_SECRET", app_secret)
+    if stage not in {"00", "10", "20", "30", "40"}:
+        raise RuntimeError("MONTHLY_STAGE must be one of 00/10/20/30/40")
+
+    io = DropboxIO(refresh_token=tok, app_key=app_key, app_secret=app_secret)
+    logger = JsonlLogger(io, logs_dir=logs_dir)
+    store = StateStore(io=io, state_path=state_path)
+
+    logger.log(
+        {
+            "event": "run_start",
+            "stage": stage,
+            "state_path": state_path,
+            "logs_dir": logs_dir,
+            "max_files": max_files,
+        }
+    )
+
+    processed = stage_copy_forward(
+        io=io,
+        logger=logger,
+        store=store,
+        stage=stage,
+        max_files=max_files,
+    )
+
+    logger.log({"event": "run_end", "stage": stage, "processed": processed})
+    return 0
 
 
 if __name__ == "__main__":
