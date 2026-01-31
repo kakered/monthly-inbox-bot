@@ -1,234 +1,191 @@
 # -*- coding: utf-8 -*-
 """
-src/monthly_main.py
+monthly_main.py (FULL OVERWRITE VERSION)
 
-MONTHLY pipeline entrypoint.
-
-Design goal:
-- Must run safely with NO CLI args (GitHub Actions runs: python -m src.monthly_main)
-- Stage-driven routing via env vars:
-    MONTHLY_STAGE in {"00","10","20","30","40"}
-    STAGE00_IN/OUT/DONE, ... STAGE40_IN/OUT/DONE
-- Minimal robust behavior (stage_copy_forward):
-    * list .xlsx/.xlsm in STAGEXX_IN
-    * download bytes
-    * upload copy to STAGEXX_OUT (stage-tagged filename)
-    * move original to STAGEXX_DONE (rev-tagged filename)
-    * optionally copy original bytes forward to next stage IN (same basename)
-    * persist state.json to skip already-processed items
-
-Notes:
-- This module intentionally does NOT require sys.argv[1].
-- If you later want a "single file mode", add optional args but keep default no-arg path.
+- GitHub Actions / runpy / python -m 実行に完全対応
+- sys.argv に依存しない
+- MONTHLY_STAGE 環境変数駆動
+- Dropbox IN フォルダをスキャンして逐次処理
+- state.json により再処理防止
 """
 
 from __future__ import annotations
 
 import os
+import sys
+import json
 import time
-from typing import Tuple
+import traceback
+from datetime import datetime, timezone
+from typing import List, Optional
 
-from .dropbox_io import DropboxIO, DbxEntry
-from .state_store import StateStore
-from .logger import JsonlLogger
+from openai import OpenAI
+import dropbox
+from dropbox.files import FileMetadata
+from dropbox.exceptions import ApiError
 
-
-# ----------------------------
-# helpers
-# ----------------------------
-def _env(name: str, default: str = "") -> str:
-    return (os.environ.get(name, default) or "").strip()
-
-
-def _utc_stamp() -> str:
-    return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+from state_store import StateStore
+from utils_dropbox_item import download_file, upload_file, move_file
 
 
-def _stage_vars(stage: str) -> Tuple[str, str, str]:
-    return (
-        _env(f"STAGE{stage}_IN"),
-        _env(f"STAGE{stage}_OUT"),
-        _env(f"STAGE{stage}_DONE"),
+# =========================================================
+# 基本設定
+# =========================================================
+
+UTC = timezone.utc
+
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+DEPTH = os.environ.get("DEPTH", "medium")
+
+MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "200"))
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "80000"))
+
+MONTHLY_STAGE = (os.environ.get("MONTHLY_STAGE", "00") or "00").strip()
+
+LOGS_DIR = os.environ.get("LOGS_DIR", "/_system/logs")
+STATE_PATH = os.environ.get("STATE_PATH", "/_system/state.json")
+
+
+def stage_path(stage: str, kind: str) -> str:
+    key = f"STAGE{stage}_{kind}"
+    v = os.environ.get(key)
+    if not v:
+        raise RuntimeError(f"Missing env var: {key}")
+    return v
+
+
+STAGE_IN = stage_path(MONTHLY_STAGE, "IN")
+STAGE_OUT = stage_path(MONTHLY_STAGE, "OUT")
+STAGE_DONE = stage_path(MONTHLY_STAGE, "DONE")
+
+
+# =========================================================
+# 初期化
+# =========================================================
+
+def init_dropbox() -> dropbox.Dropbox:
+    return dropbox.Dropbox(
+        oauth2_refresh_token=os.environ["DROPBOX_REFRESH_TOKEN"],
+        app_key=os.environ["DROPBOX_APP_KEY"],
+        app_secret=os.environ["DROPBOX_APP_SECRET"],
     )
 
 
-def _next_stage(stage: str) -> str:
-    order = ["00", "10", "20", "30", "40"]
-    if stage not in order:
-        return ""
-    i = order.index(stage)
-    return order[i + 1] if (i + 1) < len(order) else ""
+def init_openai() -> OpenAI:
+    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
-def _is_xlsx(name: str) -> bool:
-    n = name.lower()
-    return n.endswith(".xlsx") or n.endswith(".xlsm")
+# =========================================================
+# ログ
+# =========================================================
+
+def log_event(event: dict):
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    path = f"{LOGS_DIR}/{today}/run_{ts}.jsonl"
+
+    event = dict(event)
+    event["ts_utc"] = datetime.now(UTC).isoformat()
+
+    upload_file(
+        dbx,
+        path,
+        (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"),
+        mode="add",
+    )
 
 
-def _file_key(e: DbxEntry) -> str:
-    # stable-ish: path + rev if present
-    if getattr(e, "rev", None):
-        return f"{e.path}@{e.rev}"
-    return e.path
+# =========================================================
+# Dropbox ユーティリティ
+# =========================================================
+
+def list_inbox_files(dbx: dropbox.Dropbox) -> List[FileMetadata]:
+    try:
+        res = dbx.files_list_folder(STAGE_IN)
+    except ApiError as e:
+        raise RuntimeError(f"Dropbox list_folder failed: {e}")
+
+    files = [
+        e for e in res.entries
+        if isinstance(e, FileMetadata)
+    ]
+    return files[:MAX_FILES_PER_RUN]
 
 
-def _require_nonempty(name: str, value: str) -> None:
-    if not value:
-        raise RuntimeError(f"Missing required env: {name}")
+# =========================================================
+# メイン処理（stage 00 用：Excel 前処理想定）
+# =========================================================
 
-
-# ----------------------------
-# stage runner
-# ----------------------------
-def stage_copy_forward(
-    *,
-    io: DropboxIO,
-    logger: JsonlLogger,
-    store: StateStore,
-    stage: str,
-    max_files: int,
-) -> int:
+def process_stage_00(file: FileMetadata):
     """
-    Minimal robust behavior:
-    - Read files from STAGEXX_IN
-    - Copy bytes to STAGEXX_OUT with a stage-tagged filename
-    - Move original to STAGEXX_DONE with a rev-tagged filename
-    - Also copy original bytes to NEXT_STAGE_IN with same basename (optional)
+    Stage00:
+    - Excel をそのまま OUT にコピー（前処理）
     """
-    p_in, p_out, p_done = _stage_vars(stage)
-    if not (p_in and p_out and p_done):
-        raise RuntimeError(
-            f"Stage{stage} paths are missing. "
-            f"Need STAGE{stage}_IN / STAGE{stage}_OUT / STAGE{stage}_DONE."
-        )
+    raw = download_file(dbx, file.path_lower)
 
-    # ensure folders exist (best-effort; DropboxIO should be idempotent)
-    io.ensure_folder(os.path.dirname(p_in) or "/")
-    io.ensure_folder(p_in)
-    io.ensure_folder(p_out)
-    io.ensure_folder(p_done)
+    out_name = (
+        os.path.splitext(file.name)[0]
+        + f"__stage00__{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.xlsx"
+    )
+    out_path = f"{STAGE_OUT}/{out_name}"
 
-    state = store.load()
-    bucket = store.get_stage_bucket(state, stage)
-    bucket["last_run_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    upload_file(dbx, out_path, raw, mode="add")
 
-    # list inputs
-    entries = [e for e in io.list_folder(p_in) if e.is_file and _is_xlsx(e.name)]
-    entries = entries[: max_files if max_files > 0 else 0]
+    # DONE に移動
+    move_file(dbx, file.path_lower, f"{STAGE_DONE}/{file.name}")
 
+
+# =========================================================
+# エントリポイント
+# =========================================================
+
+def main():
+    global dbx
+
+    start = time.time()
     processed = 0
-    for e in entries:
-        k = _file_key(e)
-        if store.is_done(bucket, k):
+
+    log_event({"event": "run_start", "stage": MONTHLY_STAGE})
+
+    files = list_inbox_files(dbx)
+
+    for f in files:
+        if state.is_done(MONTHLY_STAGE, f.path_lower):
             continue
 
-        src_path = e.path
-        base = e.name
+        try:
+            if MONTHLY_STAGE == "00":
+                process_stage_00(f)
+            else:
+                raise NotImplementedError(f"Stage {MONTHLY_STAGE} not implemented")
 
-        # 1) download bytes
-        data = io.download(src_path)
+            state.mark_done(MONTHLY_STAGE, f.path_lower)
+            processed += 1
 
-        # 2) write OUT (keep original copy for debugging)
-        stem, ext = os.path.splitext(base)
-        out_name = f"{stem}__stage{stage}__{_utc_stamp()}{ext}"
-        out_path = f"{p_out}/{out_name}"
-        io.upload_overwrite(out_path, data)
+        except Exception as e:
+            log_event({
+                "event": "file_error",
+                "stage": MONTHLY_STAGE,
+                "file": f.path_display,
+                "error": repr(e),
+                "traceback": traceback.format_exc(),
+            })
 
-        # 3) move to DONE (rename with rev)
-        rev = e.rev or "no-rev"
-        done_name = f"{stem}__rev-{rev}__{_utc_stamp()}{ext}"
-        done_path = f"{p_done}/{done_name}"
-        io.move_replace(src_path, done_path)
+    state.flush()
 
-        # 4) copy forward to next stage IN (optional)
-        nxt = _next_stage(stage)
-        copied_forward = False
-        if nxt:
-            nxt_in, _, _ = _stage_vars(nxt)
-            if nxt_in:
-                io.ensure_folder(nxt_in)
-                nxt_path = f"{nxt_in}/{base}"
-                io.upload_overwrite(nxt_path, data)
-                copied_forward = True
-
-        # 5) mark done + persist state
-        store.mark_done(bucket, k)
-        store.save(state)
-
-        logger.log(
-            {
-                "event": "file_processed",
-                "stage": stage,
-                "src": src_path,
-                "out": out_path,
-                "done": done_path,
-                "copied_to_next_in": copied_forward,
-                "size": len(data),
-            }
-        )
-
-        processed += 1
-
-    logger.log(
-        {
-            "event": "stage_end",
-            "stage": stage,
-            "processed": processed,
-            "in_count_scanned": len(entries),
-        }
-    )
-    return processed
+    log_event({
+        "event": "run_end",
+        "stage": MONTHLY_STAGE,
+        "processed": processed,
+        "elapsed_s": round(time.time() - start, 2),
+    })
 
 
-# ----------------------------
-# main
-# ----------------------------
-def main() -> int:
-    # credentials
-    tok = _env("DROPBOX_REFRESH_TOKEN")
-    app_key = _env("DROPBOX_APP_KEY")
-    app_secret = _env("DROPBOX_APP_SECRET")
-
-    # controls
-    stage = _env("MONTHLY_STAGE", "00")
-    max_files = int(_env("MAX_FILES_PER_RUN", "200") or "200")
-
-    # state & logs
-    state_path = _env("STATE_PATH", "/_system/state.json")
-    logs_dir = _env("LOGS_DIR", "/_system/logs")
-
-    # validate minimum envs
-    _require_nonempty("DROPBOX_REFRESH_TOKEN", tok)
-    _require_nonempty("DROPBOX_APP_KEY", app_key)
-    _require_nonempty("DROPBOX_APP_SECRET", app_secret)
-    if stage not in {"00", "10", "20", "30", "40"}:
-        raise RuntimeError("MONTHLY_STAGE must be one of 00/10/20/30/40")
-
-    io = DropboxIO(refresh_token=tok, app_key=app_key, app_secret=app_secret)
-    logger = JsonlLogger(io, logs_dir=logs_dir)
-    store = StateStore(io=io, state_path=state_path)
-
-    logger.log(
-        {
-            "event": "run_start",
-            "stage": stage,
-            "state_path": state_path,
-            "logs_dir": logs_dir,
-            "max_files": max_files,
-        }
-    )
-
-    processed = stage_copy_forward(
-        io=io,
-        logger=logger,
-        store=store,
-        stage=stage,
-        max_files=max_files,
-    )
-
-    logger.log({"event": "run_end", "stage": stage, "processed": processed})
-    return 0
-
+# =========================================================
+# 実行
+# =========================================================
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    dbx = init_dropbox()
+    state = StateStore(dbx, STATE_PATH)
+    main()
