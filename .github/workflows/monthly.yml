@@ -14,7 +14,6 @@ on:
           - "20"
           - "30"
           - "40"
-  # 必要なら定期実行（例：22分おき）
   # schedule:
   #   - cron: "*/22 * * * *"
 
@@ -35,7 +34,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ★ ここが今回の本丸：openai を含めて依存を入れる
       - name: Install dependencies
         shell: bash
         run: |
@@ -208,6 +206,30 @@ jobs:
       # ---- Preflight ----
       - name: Preflight (compile + import)
         shell: bash
+        env:
+          # ★ここが重要：import 時に参照され得る env を渡す
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          STATE_PATH: ${{ secrets.STATE_PATH }}
+          LOGS_DIR: ${{ vars.LOGS_DIR }}
+          STAGE00_IN: ${{ vars.STAGE00_IN }}
+          STAGE00_OUT: ${{ vars.STAGE00_OUT }}
+          STAGE00_DONE: ${{ vars.STAGE00_DONE }}
+          STAGE10_IN: ${{ vars.STAGE10_IN }}
+          STAGE10_OUT: ${{ vars.STAGE10_OUT }}
+          STAGE10_DONE: ${{ vars.STAGE10_DONE }}
+          STAGE20_IN: ${{ vars.STAGE20_IN }}
+          STAGE20_OUT: ${{ vars.STAGE20_OUT }}
+          STAGE20_DONE: ${{ vars.STAGE20_DONE }}
+          STAGE30_IN: ${{ vars.STAGE30_IN }}
+          STAGE30_OUT: ${{ vars.STAGE30_OUT }}
+          STAGE30_DONE: ${{ vars.STAGE30_DONE }}
+          STAGE40_IN: ${{ vars.STAGE40_IN }}
+          STAGE40_OUT: ${{ vars.STAGE40_OUT }}
+          STAGE40_DONE: ${{ vars.STAGE40_DONE }}
+          MONTHLY_STAGE: ${{ inputs.monthly_stage }}
         run: |
           set -euxo pipefail
           python -V
